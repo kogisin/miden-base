@@ -1,5 +1,5 @@
 use alloc::string::{String, ToString};
-use core::fmt;
+use core::{fmt, hash::Hash};
 
 use miden_crypto::utils::ByteWriter;
 use vm_core::{
@@ -25,6 +25,12 @@ use crate::{
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct AccountIdPrefixV0 {
     prefix: Felt,
+}
+
+impl Hash for AccountIdPrefixV0 {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.prefix.inner().hash(state);
+    }
 }
 
 impl AccountIdPrefixV0 {
@@ -95,7 +101,7 @@ impl AccountIdPrefixV0 {
 
     /// See [`AccountIdPrefix::is_public`](crate::account::AccountIdPrefix::is_public) for details.
     pub fn is_public(&self) -> bool {
-        self.storage_mode() == AccountStorageMode::Public
+        self.storage_mode().is_public()
     }
 
     /// See [`AccountIdPrefix::version`](crate::account::AccountIdPrefix::version) for details.

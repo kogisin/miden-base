@@ -16,7 +16,7 @@ use crate::{
 /// This is a sequential hash of the tuple `(TRANSACTION_ID || [account_id_prefix,
 /// account_id_suffix, 0, 0])` of all transactions and the accounts their executed against in the
 /// batch.
-#[derive(Debug, Copy, Clone, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Debug, Copy, Clone, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub struct BatchId(Digest);
 
 impl BatchId {
@@ -29,7 +29,7 @@ impl BatchId {
     }
 
     /// Calculates a batch ID from the given transaction ID and account ID tuple.
-    pub fn from_ids(iter: impl Iterator<Item = (TransactionId, AccountId)>) -> Self {
+    pub fn from_ids(iter: impl IntoIterator<Item = (TransactionId, AccountId)>) -> Self {
         let mut elements: Vec<Felt> = Vec::new();
         for (tx_id, account_id) in iter {
             elements.extend_from_slice(tx_id.as_elements());

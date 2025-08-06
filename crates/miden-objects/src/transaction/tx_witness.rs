@@ -1,15 +1,10 @@
-use alloc::vec::Vec;
-
 use super::{AdviceInputs, TransactionArgs, TransactionInputs};
-use crate::{
-    account::AccountCode,
-    utils::serde::{ByteReader, Deserializable, DeserializationError, Serializable},
-};
+use crate::utils::serde::{ByteReader, Deserializable, DeserializationError, Serializable};
 
 // TRANSACTION WITNESS
 // ================================================================================================
 
-/// Transaction witness contains all the data required to execute and prove a Miden rollup
+/// Transaction witness contains all the data required to execute and prove a Miden blockchain
 /// transaction.
 ///
 /// The main purpose of the transaction witness is to enable stateless re-execution and proving
@@ -18,8 +13,9 @@ use crate::{
 /// A transaction witness consists of:
 /// - Transaction inputs which contain information about the initial state of the account, input
 ///   notes, block header etc.
-/// - Optional transaction arguments which may contain a transaction script, note arguments, and any
-///   additional advice data to initialize the advice provide with prior to transaction execution.
+/// - Optional transaction arguments which may contain a transaction script, note arguments,
+///   transaction script argument and any additional advice data to initialize the advice provider
+///   with prior to transaction execution.
 /// - Advice witness which contains all data requested by the VM from the advice provider while
 ///   executing the transaction program.
 ///
@@ -32,7 +28,6 @@ pub struct TransactionWitness {
     pub tx_inputs: TransactionInputs,
     pub tx_args: TransactionArgs,
     pub advice_witness: AdviceInputs,
-    pub account_codes: Vec<AccountCode>,
 }
 
 // SERIALIZATION
@@ -43,7 +38,6 @@ impl Serializable for TransactionWitness {
         self.tx_inputs.write_into(target);
         self.tx_args.write_into(target);
         self.advice_witness.write_into(target);
-        self.account_codes.write_into(target);
     }
 }
 
@@ -52,12 +46,6 @@ impl Deserializable for TransactionWitness {
         let tx_inputs = TransactionInputs::read_from(source)?;
         let tx_args = TransactionArgs::read_from(source)?;
         let advice_witness = AdviceInputs::read_from(source)?;
-        let account_codes = <Vec<AccountCode>>::read_from(source)?;
-        Ok(Self {
-            tx_inputs,
-            tx_args,
-            advice_witness,
-            account_codes,
-        })
+        Ok(Self { tx_inputs, tx_args, advice_witness })
     }
 }

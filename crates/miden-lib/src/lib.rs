@@ -1,4 +1,5 @@
 #![no_std]
+
 use alloc::sync::Arc;
 
 #[macro_use]
@@ -19,11 +20,10 @@ pub mod account;
 pub mod errors;
 pub mod note;
 pub mod transaction;
+pub mod utils;
 
 // RE-EXPORTS
 // ================================================================================================
-
-pub use miden_objects::utils;
 pub use miden_stdlib::StdLibrary;
 
 // CONSTANTS

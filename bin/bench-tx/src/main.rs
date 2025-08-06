@@ -1,21 +1,21 @@
 use core::fmt;
-use std::{
-    fs::{File, read_to_string, write},
-    io::Write,
-    path::Path,
-};
+use std::{fs::File, io::Write, path::Path};
 
+use anyhow::Context;
 use miden_lib::{note::create_p2id_note, transaction::TransactionKernel};
 use miden_objects::{
-    Felt,
-    account::{AccountId, AccountStorageMode, AccountType},
+    Felt, FieldElement,
+    account::{Account, AccountId, AccountStorageMode, AccountType},
     asset::{Asset, FungibleAsset},
     crypto::rand::RpoRandomCoin,
     note::NoteType,
-    transaction::{TransactionArgs, TransactionMeasurements, TransactionScript},
+    testing::{
+        account_component::IncrNonceAuthComponent,
+        account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_UPDATABLE_CODE,
+    },
+    transaction::{TransactionMeasurements, TransactionScript},
 };
-use miden_tx::{TransactionExecutor, testing::TransactionContextBuilder};
-use vm_processor::ONE;
+use miden_testing::{TransactionContextBuilder, utils::create_p2any_note};
 
 mod utils;
 use utils::{
@@ -37,11 +37,11 @@ impl fmt::Display for Benchmark {
     }
 }
 
-fn main() -> Result<(), String> {
+fn main() -> anyhow::Result<()> {
     // create a template file for benchmark results
     let path = Path::new("bin/bench-tx/bench-tx.json");
-    let mut file = File::create(path).map_err(|e| e.to_string())?;
-    file.write_all(b"{}").map_err(|e| e.to_string())?;
+    let mut file = File::create(path).context("failed to create file")?;
+    file.write_all(b"{}").context("failed to write to file")?;
 
     // run all available benchmarks
     let benchmark_results = vec![
@@ -59,32 +59,36 @@ fn main() -> Result<(), String> {
 // ================================================================================================
 
 /// Runs the default transaction with empty transaction script and two default notes.
-pub fn benchmark_default_tx() -> Result<TransactionMeasurements, String> {
-    let tx_context = TransactionContextBuilder::with_standard_account(ONE)
-        .with_mock_notes_preserved()
-        .build();
+#[allow(clippy::arc_with_non_send_sync)]
+pub fn benchmark_default_tx() -> anyhow::Result<TransactionMeasurements> {
+    let assembler = TransactionKernel::testing_assembler();
+    let auth_component = IncrNonceAuthComponent::new(assembler.clone()).unwrap();
 
-    let account_id = tx_context.account().id();
+    let tx_context = {
+        let account = Account::mock(
+            ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_UPDATABLE_CODE,
+            Felt::ONE,
+            auth_component,
+            assembler,
+        );
 
-    let block_ref = tx_context.tx_inputs().block_header().block_num();
-    let note_ids = tx_context
-        .tx_inputs()
-        .input_notes()
-        .iter()
-        .map(|note| note.id())
-        .collect::<Vec<_>>();
+        let input_note_1 =
+            create_p2any_note(ACCOUNT_ID_SENDER.try_into().unwrap(), &[FungibleAsset::mock(100)]);
 
-    let executor: TransactionExecutor =
-        TransactionExecutor::new(tx_context.get_data_store(), None).with_tracing();
-    let executed_transaction = executor
-        .execute_transaction(account_id, block_ref, &note_ids, tx_context.tx_args().clone())
-        .map_err(|e| e.to_string())?;
+        let input_note_2 =
+            create_p2any_note(ACCOUNT_ID_SENDER.try_into().unwrap(), &[FungibleAsset::mock(150)]);
+        TransactionContextBuilder::new(account)
+            .extend_input_notes(vec![input_note_1, input_note_2])
+            .build()?
+    };
+    let executed_transaction = tx_context.execute().context("failed to execute transaction")?;
 
     Ok(executed_transaction.into())
 }
 
 /// Runs the transaction which consumes a P2ID note into a basic wallet.
-pub fn benchmark_p2id() -> Result<TransactionMeasurements, String> {
+#[allow(clippy::arc_with_non_send_sync)]
+pub fn benchmark_p2id() -> anyhow::Result<TransactionMeasurements> {
     // Create assets
     let faucet_id = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap();
     let fungible_asset: Asset = FungibleAsset::new(faucet_id, 100).unwrap().into();
@@ -113,30 +117,16 @@ pub fn benchmark_p2id() -> Result<TransactionMeasurements, String> {
     )
     .unwrap();
 
-    let tx_context = TransactionContextBuilder::new(target_account.clone())
-        .input_notes(vec![note.clone()])
-        .build();
-
-    let executor = TransactionExecutor::new(tx_context.get_data_store(), Some(falcon_auth.clone()))
-        .with_tracing();
-
-    let block_ref = tx_context.tx_inputs().block_header().block_num();
-    let note_ids = tx_context
-        .tx_inputs()
-        .input_notes()
-        .iter()
-        .map(|note| note.id())
-        .collect::<Vec<_>>();
-
     let tx_script_target =
-        TransactionScript::compile(DEFAULT_AUTH_SCRIPT, [], TransactionKernel::assembler())
-            .unwrap();
-    let tx_args_target = TransactionArgs::with_tx_script(tx_script_target);
+        TransactionScript::compile(DEFAULT_AUTH_SCRIPT, TransactionKernel::assembler()).unwrap();
 
-    // execute transaction
-    let executed_transaction = executor
-        .execute_transaction(target_account.id(), block_ref, &note_ids, tx_args_target)
-        .unwrap();
+    let tx_context = TransactionContextBuilder::new(target_account.clone())
+        .extend_input_notes(vec![note])
+        .tx_script(tx_script_target)
+        .authenticator(Some(falcon_auth))
+        .build()?;
+
+    let executed_transaction = tx_context.execute()?;
 
     Ok(executed_transaction.into())
 }

@@ -24,10 +24,10 @@ mod errors;
 
 pub use constants::*;
 pub use errors::{
-    AccountDeltaError, AccountError, AccountIdError, AssetError, AssetVaultError,
-    BatchAccountUpdateError, ChainMmrError, NoteError, NullifierTreeError, ProposedBatchError,
-    ProposedBlockError, ProvenTransactionError, TransactionInputError, TransactionOutputError,
-    TransactionScriptError,
+    AccountDeltaError, AccountError, AccountIdError, AccountTreeError, AssetError, AssetVaultError,
+    BatchAccountUpdateError, NetworkIdError, NoteError, NullifierTreeError, PartialBlockchainError,
+    ProposedBatchError, ProposedBlockError, ProvenBatchError, ProvenTransactionError,
+    TokenSymbolError, TransactionInputError, TransactionOutputError, TransactionScriptError,
 };
 pub use miden_crypto::hash::rpo::{Rpo256 as Hasher, RpoDigest as Digest};
 pub use vm_core::{
@@ -39,9 +39,9 @@ pub use vm_core::{
 pub mod assembly {
     pub use assembly::{
         Assembler, AssemblyError, Compile, CompileOptions, DefaultSourceManager, KernelLibrary,
-        Library, LibraryNamespace, LibraryPath, SourceManager, Version,
+        Library, LibraryNamespace, LibraryPath, SourceFile, SourceId, SourceManager, Version,
         ast::{Module, ModuleKind, ProcedureName, QualifiedProcedureName},
-        mast,
+        diagnostics, mast,
     };
 }
 
@@ -106,7 +106,7 @@ pub mod utils {
             };
 
             // This digit's nibble offset within the felt. We need to invert the nibbles per
-            // byte for endianess reasons i.e. ABCD -> BADC.
+            // byte for endianness reasons i.e. ABCD -> BADC.
             let inibble = if i % 2 == 0 { (i + 1) % 16 } else { (i - 1) % 16 };
 
             let value = hex_digit << (inibble * 4);

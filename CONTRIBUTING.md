@@ -4,10 +4,10 @@
 
 We want to make contributing to this project as easy and transparent as possible, whether it's:
 
-- Reporting a [bug](https://github.com/0xPolygonMiden/miden-base/issues/new?assignees=&labels=bug&projects=&template=1-bugreport.yml)
-- Taking part in [discussions](https://github.com/0xPolygonMiden/miden-base/discussions)
-- Submitting a [fix](https://github.com/0xPolygonMiden/miden-base/pulls)
-- Proposing new [features](https://github.com/0xPolygonMiden/miden-base/issues/new?assignees=&labels=enhancement&projects=&template=2-feature-request.yml)
+- Reporting a [bug](https://github.com/0xMiden/miden-base/issues/new?assignees=&labels=bug&projects=&template=1-bugreport.yml)
+- Taking part in [discussions](https://github.com/0xMiden/miden-base/discussions)
+- Submitting a [fix](https://github.com/0xMiden/miden-base/pulls)
+- Proposing new [features](https://github.com/0xMiden/miden-base/issues/new?assignees=&labels=enhancement&projects=&template=2-feature-request.yml)
 
 &nbsp;
 
@@ -76,7 +76,13 @@ We are using [Github Flow](https://docs.github.com/en/get-started/quickstart/git
   // ================================================================================
   ```
 
-- [Rustfmt](https://github.com/rust-lang/rustfmt), [Clippy](https://github.com/rust-lang/rust-clippy) and [Rustdoc](https://doc.rust-lang.org/rustdoc/index.html) linting is included in CI pipeline. Anyways it's preferable to run linting locally before push. To simplify running these commands in a reproducible manner we use `make` commands, you can run:
+- [Rustfmt](https://github.com/rust-lang/rustfmt), [Clippy](https://github.com/rust-lang/rust-clippy), [Rustdoc](https://doc.rust-lang.org/rustdoc/index.html) and [Typos](https://github.com/crate-ci/typos) linting is included in CI pipeline. Anyways it's preferable to run linting locally before push. To simplify running these commands in a reproducible manner we use `make` commands, you can install the required tools by running:
+
+  ```
+  make install-tools
+  ```
+
+  and then run:
 
   ```
   make lint
@@ -106,7 +112,7 @@ To make sure all commits adhere to our programming standards we use [pre-commit]
 2. Commit messages and code style follow conventions.
 3. Tests added for new functionality.
 4. Documentation/comments updated for all changes according to our documentation convention.
-5. Rustfmt, Clippy and Rustdoc linting passed (Will be run automatically by pre-commit).
+5. Rustfmt, Clippy, Rustdoc and Typos linting passed (Will be run automatically by pre-commit).
 6. New branch rebased from `next`.
 
 &nbsp;

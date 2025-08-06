@@ -75,9 +75,27 @@ impl AccountInterface {
         self.account_id.is_regular_account()
     }
 
-    /// Returns true if the reference account is public.
+    /// Returns `true` if the full state of the account is on chain, i.e. if the modes are
+    /// [`AccountStorageMode::Public`](miden_objects::account::AccountStorageMode::Public) or
+    /// [`AccountStorageMode::Network`](miden_objects::account::AccountStorageMode::Network),
+    /// `false` otherwise.
+    pub fn is_onchain(&self) -> bool {
+        self.account_id.is_onchain()
+    }
+
+    /// Returns `true` if the reference account is a private account, `false` otherwise.
+    pub fn is_private(&self) -> bool {
+        self.account_id.is_private()
+    }
+
+    /// Returns true if the reference account is a public account, `false` otherwise.
     pub fn is_public(&self) -> bool {
         self.account_id.is_public()
+    }
+
+    /// Returns true if the reference account is a network account, `false` otherwise.
+    pub fn is_network(&self) -> bool {
+        self.account_id.is_network()
     }
 
     /// Returns a reference to the vector of used authentication schemes.
@@ -113,7 +131,7 @@ impl AccountInterface {
                     component_proc_digests
                         .extend(basic_wallet_library().mast_forest().procedure_digests());
                 },
-                AccountComponentInterface::BasicFungibleFaucet => {
+                AccountComponentInterface::BasicFungibleFaucet(_) => {
                     component_proc_digests
                         .extend(basic_fungible_faucet_library().mast_forest().procedure_digests());
                 },
@@ -135,30 +153,6 @@ impl AccountInterface {
 // ------------------------------------------------------------------------------------------------
 /// Code generation
 impl AccountInterface {
-    /// Builds a simple authentication script for the transaction that doesn't send any notes.
-    ///
-    /// Resulting transaction script is generated from this source:
-    ///
-    /// ```masm
-    /// begin
-    ///     call.::miden::contracts::auth::basic::auth_tx_rpo_falcon512
-    /// end
-    /// ```
-    ///
-    /// # Errors:
-    /// Returns an error if:
-    /// - the account interface does not have any authentication schemes.
-    pub fn build_auth_script(
-        &self,
-        in_debug_mode: bool,
-    ) -> Result<TransactionScript, AccountInterfaceError> {
-        let auth_script_source = format!("begin\n{}\nend", self.build_tx_authentication_section());
-        let assembler = TransactionKernel::assembler().with_debug_mode(in_debug_mode);
-
-        TransactionScript::compile(auth_script_source, [], assembler)
-            .map_err(AccountInterfaceError::InvalidTransactionScript)
-    }
-
     /// Returns a transaction script which sends the specified notes using the procedures available
     /// in the current interface.
     ///
@@ -176,8 +170,7 @@ impl AccountInterface {
     ///
     /// # Example
     ///
-    /// Example of the `send_note` script with specified expiration delta, one output note and
-    /// RpoFalcon512 authentication:
+    /// Example of the `send_note` script with specified expiration delta and one output note:
     ///
     /// ```masm
     /// begin
@@ -187,8 +180,6 @@ impl AccountInterface {
     ///
     ///     push.{asset amount}
     ///     call.::miden::contracts::faucets::basic_fungible::distribute dropw dropw drop
-    ///
-    ///     call.::miden::contracts::auth::basic::auth_tx_rpo_falcon512
     /// end
     /// ```
     ///
@@ -200,8 +191,8 @@ impl AccountInterface {
     /// - the note created by the faucet doesn't contain exactly one asset.
     /// - a faucet tries to distribute an asset with a different faucet ID.
     ///
-    /// [wallet]: miden_lib::account::interface::AccountComponentInterface::BasicWallet
-    /// [faucet]: miden_lib::account::interface::AccountComponentInterface::BasicFungibleFaucet
+    /// [wallet]: crate::account::interface::AccountComponentInterface::BasicWallet
+    /// [faucet]: crate::account::interface::AccountComponentInterface::BasicFungibleFaucet
     pub fn build_send_notes_script(
         &self,
         output_notes: &[PartialNote],
@@ -211,30 +202,16 @@ impl AccountInterface {
         let note_creation_source = self.build_create_notes_section(output_notes)?;
 
         let script = format!(
-            "begin\n{}\n{}\n{}\nend",
+            "begin\n{}\n{}\nend",
             self.build_set_tx_expiration_section(expiration_delta),
             note_creation_source,
-            self.build_tx_authentication_section()
         );
 
         let assembler = TransactionKernel::assembler().with_debug_mode(in_debug_mode);
-        let tx_script = TransactionScript::compile(script, [], assembler)
+        let tx_script = TransactionScript::compile(script, assembler)
             .map_err(AccountInterfaceError::InvalidTransactionScript)?;
 
         Ok(tx_script)
-    }
-
-    /// Returns a string with the authentication procedure call for the script.
-    fn build_tx_authentication_section(&self) -> String {
-        let mut auth_script = String::new();
-        self.auth().iter().for_each(|auth_scheme| match auth_scheme {
-            &AuthScheme::RpoFalcon512 { pub_key: _ } => {
-                auth_script
-                    .push_str("call.::miden::contracts::auth::basic::auth_tx_rpo_falcon512\n");
-            },
-        });
-
-        auth_script
     }
 
     /// Generates a note creation code required for the `send_note` transaction script.
@@ -253,8 +230,10 @@ impl AccountInterface {
         &self,
         output_notes: &[PartialNote],
     ) -> Result<String, AccountInterfaceError> {
-        if self.components().contains(&AccountComponentInterface::BasicFungibleFaucet) {
-            AccountComponentInterface::BasicFungibleFaucet.send_note_body(*self.id(), output_notes)
+        if let Some(basic_fungible_faucet) = self.components().iter().find(|component_interface| {
+            matches!(component_interface, AccountComponentInterface::BasicFungibleFaucet(_))
+        }) {
+            basic_fungible_faucet.send_note_body(*self.id(), output_notes)
         } else if self.components().contains(&AccountComponentInterface::BasicWallet) {
             AccountComponentInterface::BasicWallet.send_note_body(*self.id(), output_notes)
         } else {
@@ -311,6 +290,8 @@ pub enum NoteAccountCompatibility {
     /// The account has all necessary procedures of one execution branch of the note script. This
     /// means the note may be able to be consumed by the account if that branch is executed.
     Maybe,
+    /// A note could be successfully executed and consumed by the account.
+    Yes,
 }
 
 // HELPER FUNCTIONS

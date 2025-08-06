@@ -1,6 +1,8 @@
 use alloc::vec::Vec;
 
-use super::{AccountStorage, Felt, StorageSlot, StorageSlotType, Word};
+use vm_processor::Digest;
+
+use super::{AccountStorage, Felt, Hasher, StorageSlot, StorageSlotType, Word};
 use crate::{
     AccountError, ZERO,
     utils::serde::{ByteReader, ByteWriter, Deserializable, DeserializationError, Serializable},
@@ -75,8 +77,9 @@ impl AccountStorageHeader {
     }
 
     /// Returns the number of slots contained in the storage header.
-    pub fn num_slots(&self) -> usize {
-        self.slots.len()
+    pub fn num_slots(&self) -> u8 {
+        // SAFETY: The constructors of this type ensure this value fits in a u8.
+        self.slots.len() as u8
     }
 
     /// Returns a slot contained in the storage header at a given index.
@@ -88,6 +91,12 @@ impl AccountStorageHeader {
             slots_len: self.slots.len() as u8,
             index: index as u8,
         })
+    }
+
+    // NOTE: The way of computing the commitment should be kept in sync with `AccountStorage`
+    /// Computes the account storage header commitment.
+    pub fn compute_commitment(&self) -> Digest {
+        Hasher::hash_elements(&self.as_elements())
     }
 
     /// Converts storage slots of this account storage header into a vector of field elements.
@@ -105,9 +114,9 @@ impl AccountStorageHeader {
     }
 }
 
-impl From<AccountStorage> for AccountStorageHeader {
-    fn from(value: AccountStorage) -> Self {
-        value.get_header()
+impl From<&AccountStorage> for AccountStorageHeader {
+    fn from(value: &AccountStorage) -> Self {
+        value.to_header()
     }
 }
 
@@ -146,32 +155,26 @@ mod tests {
 
     #[test]
     fn test_from_account_storage() {
+        let storage_map = AccountStorage::mock_map();
+
         // create new storage header from AccountStorage
         let slots = vec![
             (StorageSlotType::Value, [Felt::new(1), Felt::new(2), Felt::new(3), Felt::new(4)]),
             (StorageSlotType::Value, [Felt::new(5), Felt::new(6), Felt::new(7), Felt::new(8)]),
-            (
-                StorageSlotType::Map,
-                [
-                    Felt::new(12405212884040084310),
-                    Felt::new(17614307840949763446),
-                    Felt::new(6101527485586301500),
-                    Felt::new(14442045877206841081),
-                ],
-            ),
+            (StorageSlotType::Map, storage_map.root().into()),
         ];
 
         let expected_header = AccountStorageHeader { slots };
         let account_storage = AccountStorage::mock();
 
-        assert_eq!(expected_header, AccountStorageHeader::from(account_storage))
+        assert_eq!(expected_header, AccountStorageHeader::from(&account_storage))
     }
 
     #[test]
     fn test_serde_account_storage_header() {
         // create new storage header
         let storage = AccountStorage::mock();
-        let storage_header = AccountStorageHeader::from(storage);
+        let storage_header = AccountStorageHeader::from(&storage);
 
         // serde storage header
         let bytes = storage_header.to_bytes();

@@ -1,33 +1,35 @@
 use alloc::{
     boxed::Box,
     collections::{BTreeMap, BTreeSet},
-    string::ToString,
     sync::Arc,
     vec::Vec,
 };
 
-use miden_lib::{
-    errors::tx_kernel_errors::TX_KERNEL_ERRORS,
-    transaction::{
-        TransactionEvent, TransactionEventError, TransactionKernelError, TransactionTrace,
-        memory::{CURRENT_INPUT_NOTE_PTR, NATIVE_NUM_ACCT_STORAGE_SLOTS_PTR},
-    },
+use miden_lib::transaction::{
+    TransactionEvent, TransactionEventError, TransactionKernelError,
+    memory::{CURRENT_INPUT_NOTE_PTR, NATIVE_NUM_ACCT_STORAGE_SLOTS_PTR},
 };
 use miden_objects::{
     Digest, Hasher,
-    account::{AccountDelta, AccountHeader},
+    account::{AccountDelta, PartialAccount},
+    assembly::mast::MastNodeExt,
     asset::Asset,
     note::NoteId,
     transaction::{OutputNote, TransactionMeasurements},
     vm::RowIndex,
 };
 use vm_processor::{
-    AdviceProvider, AdviceSource, ContextId, ExecutionError, Felt, Host, MastForest,
-    MastForestStore, ProcessState,
+    AdviceProvider, AdviceSource, ContextId, ErrorContext, ExecutionError, Felt, Host, MastForest,
+    MastForestStore, MemoryError, ProcessState,
 };
 
 mod account_delta_tracker;
 use account_delta_tracker::AccountDeltaTracker;
+
+mod storage_delta_tracker;
+
+mod link_map;
+pub use link_map::{Entry, EntryMetadata, LinkMap};
 
 mod account_procedures;
 pub use account_procedures::AccountProcedureIndexMap;
@@ -35,12 +37,13 @@ pub use account_procedures::AccountProcedureIndexMap;
 mod note_builder;
 use note_builder::OutputNoteBuilder;
 
+mod script_mast_forest_store;
+pub use script_mast_forest_store::ScriptMastForestStore;
+
 mod tx_progress;
 pub use tx_progress::TransactionProgress;
 
-use crate::{
-    auth::TransactionAuthenticator, errors::TransactionHostError, executor::TransactionMastStore,
-};
+use crate::{auth::TransactionAuthenticator, errors::TransactionHostError};
 
 // TRANSACTION HOST
 // ================================================================================================
@@ -50,21 +53,25 @@ use crate::{
 /// Transaction hosts are created on a per-transaction basis. That is, a transaction host is meant
 /// to support execution of a single transaction and is discarded after the transaction finishes
 /// execution.
-pub struct TransactionHost<A> {
+pub struct TransactionHost<'store, 'auth, A> {
     /// Advice provider which is used to provide non-deterministic inputs to the transaction
     /// runtime.
     adv_provider: A,
 
-    /// MAST store which contains the code required to execute the transaction.
-    mast_store: Arc<TransactionMastStore>,
+    /// MAST store which contains the code required to execute account code functions.
+    mast_store: &'store dyn MastForestStore,
+
+    /// MAST store which contains the forests of all scripts involved in the transaction. These
+    /// include input note scripts and the transaction script, but not account code.
+    scripts_mast_store: ScriptMastForestStore,
 
     /// Account state changes accumulated during transaction execution.
     ///
     /// This field is updated by the [TransactionHost::on_event()] handler.
     account_delta: AccountDeltaTracker,
 
-    /// A map of the account's procedure MAST roots to the corresponding procedure indexes in the
-    /// account code.
+    /// A map of the procedure MAST roots to the corresponding procedure indices for all the
+    /// account codes involved in the transaction (for native and foreign accounts alike).
     acct_procedure_index_map: AccountProcedureIndexMap,
 
     /// The list of notes created while executing a transaction stored as note_ptr |-> note_builder
@@ -73,7 +80,7 @@ pub struct TransactionHost<A> {
 
     /// Serves signature generation requests from the transaction runtime for signatures which are
     /// not present in the `generated_signatures` field.
-    authenticator: Option<Arc<dyn TransactionAuthenticator>>,
+    authenticator: Option<&'auth dyn TransactionAuthenticator>,
 
     /// Contains previously generated signatures (as a message |-> signature map) required for
     /// transaction execution.
@@ -86,40 +93,52 @@ pub struct TransactionHost<A> {
     ///
     /// This field is updated by the [TransactionHost::on_trace()] handler.
     tx_progress: TransactionProgress,
-
-    /// Contains mappings from error codes to the related error messages.
-    ///
-    /// This map is initialized at construction time from the [`TX_KERNEL_ERRORS`] array.
-    error_messages: BTreeMap<u32, &'static str>,
 }
 
-impl<A: AdviceProvider> TransactionHost<A> {
+impl<'store, 'auth, A: AdviceProvider> TransactionHost<'store, 'auth, A> {
     /// Returns a new [TransactionHost] instance with the provided [AdviceProvider].
     pub fn new(
-        account: AccountHeader,
-        adv_provider: A,
-        mast_store: Arc<TransactionMastStore>,
-        authenticator: Option<Arc<dyn TransactionAuthenticator>>,
-        mut account_code_commitments: BTreeSet<Digest>,
+        account: &PartialAccount,
+        mut adv_provider: A,
+        mast_store: &'store dyn MastForestStore,
+        scripts_mast_store: ScriptMastForestStore,
+        authenticator: Option<&'auth dyn TransactionAuthenticator>,
+        mut foreign_account_code_commitments: BTreeSet<Digest>,
     ) -> Result<Self, TransactionHostError> {
         // currently, the executor/prover do not keep track of the code commitment of the native
         // account, so we add it to the set here
-        account_code_commitments.insert(account.code_commitment());
+        foreign_account_code_commitments.insert(account.code().commitment());
+
+        // Insert the account advice map into the advice recorder.
+        // This ensures that the advice map is available during the note script execution when it
+        // calls the account's code that relies on the it's advice map data (data segments) loaded
+        // into the advice provider
+        for (key, values) in account.code().mast().advice_map().clone() {
+            adv_provider.insert_into_map(*key, values);
+        }
+
+        // Add all advice data from scripts_mast_store to the adv_provider. This ensures the
+        // advice provider has all the necessary data for script execution
+        for (key, values) in scripts_mast_store.advice_data().clone() {
+            adv_provider.insert_into_map(*key, values);
+        }
 
         let proc_index_map =
-            AccountProcedureIndexMap::new(account_code_commitments, &adv_provider)?;
+            AccountProcedureIndexMap::new(foreign_account_code_commitments, &adv_provider)?;
 
-        let kernel_assertion_errors = BTreeMap::from(TX_KERNEL_ERRORS);
         Ok(Self {
             adv_provider,
             mast_store,
-            account_delta: AccountDeltaTracker::new(&account),
+            scripts_mast_store,
+            account_delta: AccountDeltaTracker::new(
+                account.id(),
+                account.storage().header().clone(),
+            ),
             acct_procedure_index_map: proc_index_map,
             output_notes: BTreeMap::default(),
             authenticator,
             tx_progress: TransactionProgress::default(),
             generated_signatures: BTreeMap::new(),
-            error_messages: kernel_assertion_errors,
         })
     }
 
@@ -212,10 +231,11 @@ impl<A: AdviceProvider> TransactionHost<A> {
     fn on_account_push_procedure_index(
         &mut self,
         process: ProcessState,
+        err_ctx: &ErrorContext<'_, impl MastNodeExt>,
     ) -> Result<(), TransactionKernelError> {
         let proc_idx = self.acct_procedure_index_map.get_proc_index(&process)?;
         self.adv_provider
-            .push_stack(AdviceSource::Value(proc_idx.into()))
+            .push_stack(AdviceSource::Value(proc_idx.into()), err_ctx)
             .expect("failed to push value onto advice stack");
         Ok(())
     }
@@ -272,11 +292,11 @@ impl<A: AdviceProvider> TransactionHost<A> {
             process.get_stack_item(5),
         ];
 
-        // update the delta tracker only if the current and new values are different
-        if current_slot_value != new_slot_value {
-            let slot_index = slot_index.as_int() as u8;
-            self.account_delta.storage_delta().set_item(slot_index, new_slot_value);
-        }
+        self.account_delta.storage().set_item(
+            slot_index.as_int() as u8,
+            current_slot_value,
+            new_slot_value,
+        );
 
         Ok(())
     }
@@ -284,7 +304,7 @@ impl<A: AdviceProvider> TransactionHost<A> {
     /// Extracts information from the process state about the storage map being updated and
     /// records the latest values of this storage map.
     ///
-    /// Expected stack state: [slot_index, NEW_MAP_KEY, NEW_MAP_VALUE, ...]
+    /// Expected stack state: [slot_index, KEY, PREV_MAP_VALUE, NEW_MAP_VALUE]
     pub fn on_account_storage_after_set_map_item(
         &mut self,
         process: ProcessState,
@@ -303,25 +323,33 @@ impl<A: AdviceProvider> TransactionHost<A> {
         }
 
         // get the KEY to which the slot is being updated
-        let new_map_key = [
+        let key = [
             process.get_stack_item(4),
             process.get_stack_item(3),
             process.get_stack_item(2),
             process.get_stack_item(1),
         ];
 
-        // get the VALUE to which the slot is being updated
-        let new_map_value = [
+        // get the previous VALUE of the slot
+        let prev_map_value = [
             process.get_stack_item(8),
             process.get_stack_item(7),
             process.get_stack_item(6),
             process.get_stack_item(5),
         ];
 
-        let slot_index = slot_index.as_int() as u8;
-        self.account_delta.storage_delta().set_map_item(
-            slot_index,
-            new_map_key.into(),
+        // get the VALUE to which the slot is being updated
+        let new_map_value = [
+            process.get_stack_item(12),
+            process.get_stack_item(11),
+            process.get_stack_item(10),
+            process.get_stack_item(9),
+        ];
+
+        self.account_delta.storage().set_map_item(
+            slot_index.as_int() as u8,
+            key.into(),
+            prev_map_value,
             new_map_value,
         );
 
@@ -386,6 +414,7 @@ impl<A: AdviceProvider> TransactionHost<A> {
     pub fn on_signature_requested(
         &mut self,
         process: ProcessState,
+        err_ctx: &ErrorContext<'_, impl MastNodeExt>,
     ) -> Result<(), TransactionKernelError> {
         let pub_key = process.get_stack_word(0);
         let msg = process.get_stack_word(1);
@@ -418,7 +447,7 @@ impl<A: AdviceProvider> TransactionHost<A> {
 
         for r in signature {
             self.adv_provider
-                .push_stack(AdviceSource::Value(r))
+                .push_stack(AdviceSource::Value(r), err_ctx)
                 .map_err(|_| TransactionKernelError::FailedToPushAdviceStack(r))?;
         }
 
@@ -434,7 +463,10 @@ impl<A: AdviceProvider> TransactionHost<A> {
     /// # Errors
     /// Returns an error if the address of the currently executing input note is invalid (e.g.,
     /// greater than `u32::MAX`).
-    fn get_current_note_id(process: ProcessState) -> Result<Option<NoteId>, ExecutionError> {
+    fn get_current_note_id(
+        process: ProcessState,
+        err_ctx: &ErrorContext<'_, impl MastNodeExt>,
+    ) -> Result<Option<NoteId>, ExecutionError> {
         // get the note address in `Felt` or return `None` if the address hasn't been accessed
         // previously.
         let note_address_felt = match process.get_mem_value(process.ctx(), CURRENT_INPUT_NOTE_PTR) {
@@ -442,9 +474,12 @@ impl<A: AdviceProvider> TransactionHost<A> {
             None => return Ok(None),
         };
         // convert note address into u32
-        let note_address: u32 = note_address_felt
-            .try_into()
-            .map_err(|_| ExecutionError::MemoryAddressOutOfBounds(note_address_felt.as_int()))?;
+        let note_address: u32 = note_address_felt.try_into().map_err(|_| {
+            ExecutionError::MemoryError(MemoryError::address_out_of_bounds(
+                note_address_felt.as_int(),
+                err_ctx,
+            ))
+        })?;
         // if `note_address` == 0 note execution has ended and there is no valid note address
         if note_address == 0 {
             Ok(None)
@@ -472,7 +507,7 @@ impl<A: AdviceProvider> TransactionHost<A> {
 // HOST IMPLEMENTATION FOR TRANSACTION HOST
 // ================================================================================================
 
-impl<A: AdviceProvider> Host for TransactionHost<A> {
+impl<A: AdviceProvider> Host for TransactionHost<'_, '_, A> {
     type AdviceProvider = A;
 
     fn advice_provider(&self) -> &Self::AdviceProvider {
@@ -484,20 +519,30 @@ impl<A: AdviceProvider> Host for TransactionHost<A> {
     }
 
     fn get_mast_forest(&self, node_digest: &Digest) -> Option<Arc<MastForest>> {
-        self.mast_store.get(node_digest)
+        // Search in the note MAST forest store, otherwise fall back to the user-provided store
+        match self.scripts_mast_store.get(node_digest) {
+            Some(forest) => Some(forest),
+            None => self.mast_store.get(node_digest),
+        }
     }
 
-    fn on_event(&mut self, process: ProcessState, event_id: u32) -> Result<(), ExecutionError> {
+    fn on_event(
+        &mut self,
+        process: ProcessState,
+        event_id: u32,
+        err_ctx: &ErrorContext<'_, impl MastNodeExt>,
+    ) -> Result<(), ExecutionError> {
         let transaction_event = TransactionEvent::try_from(event_id)
-            .map_err(|err| ExecutionError::EventError(Box::new(err)))?;
+            .map_err(|err| ExecutionError::event_error(Box::new(err), err_ctx))?;
 
         // only the `FalconSigToStack` event can be executed outside the root context
         if process.ctx() != ContextId::root()
             && !matches!(transaction_event, TransactionEvent::FalconSigToStack)
         {
-            return Err(ExecutionError::EventError(Box::new(
-                TransactionEventError::NotRootContext(event_id),
-            )));
+            return Err(ExecutionError::event_error(
+                Box::new(TransactionEventError::NotRootContext(event_id)),
+                err_ctx,
+            ));
         }
 
         match transaction_event {
@@ -527,7 +572,7 @@ impl<A: AdviceProvider> Host for TransactionHost<A> {
             TransactionEvent::AccountAfterIncrementNonce => Ok(()),
 
             TransactionEvent::AccountPushProcedureIndex => {
-                self.on_account_push_procedure_index(process)
+                self.on_account_push_procedure_index(process,err_ctx)
             },
 
             TransactionEvent::NoteBeforeCreated => Ok(()),
@@ -536,48 +581,66 @@ impl<A: AdviceProvider> Host for TransactionHost<A> {
             TransactionEvent::NoteBeforeAddAsset => self.on_note_before_add_asset(process),
             TransactionEvent::NoteAfterAddAsset => Ok(()),
 
-            TransactionEvent::FalconSigToStack => self.on_signature_requested(process),
-        }
-        .map_err(|err| ExecutionError::EventError(Box::new(err)))?;
+            TransactionEvent::FalconSigToStack => self.on_signature_requested(process,err_ctx),
 
-        Ok(())
-    }
+            TransactionEvent::PrologueStart => {
+                self.tx_progress.start_prologue(process.clk());
+                Ok(())
+            },
+            TransactionEvent::PrologueEnd => {
+                self.tx_progress.end_prologue(process.clk());
+                Ok(())
+            },
 
-    fn on_trace(&mut self, process: ProcessState, trace_id: u32) -> Result<(), ExecutionError> {
-        let event = TransactionTrace::try_from(trace_id)
-            .map_err(|err| ExecutionError::EventError(Box::new(err)))?;
+            TransactionEvent::NotesProcessingStart => {
+                self.tx_progress.start_notes_processing(process.clk());
+                Ok(())
+            },
+            TransactionEvent::NotesProcessingEnd => {
+                self.tx_progress.end_notes_processing(process.clk());
+                Ok(())
+            },
 
-        use TransactionTrace::*;
-        match event {
-            PrologueStart => self.tx_progress.start_prologue(process.clk()),
-            PrologueEnd => self.tx_progress.end_prologue(process.clk()),
-            NotesProcessingStart => self.tx_progress.start_notes_processing(process.clk()),
-            NotesProcessingEnd => self.tx_progress.end_notes_processing(process.clk()),
-            NoteExecutionStart => {
-                let note_id = Self::get_current_note_id(process)?.expect(
+            TransactionEvent::NoteExecutionStart => {
+                let note_id = Self::get_current_note_id(process,err_ctx)?.expect(
                     "Note execution interval measurement is incorrect: check the placement of the start and the end of the interval",
                 );
                 self.tx_progress.start_note_execution(process.clk(), note_id);
+                Ok(())
             },
-            NoteExecutionEnd => self.tx_progress.end_note_execution(process.clk()),
-            TxScriptProcessingStart => self.tx_progress.start_tx_script_processing(process.clk()),
-            TxScriptProcessingEnd => self.tx_progress.end_tx_script_processing(process.clk()),
-            EpilogueStart => self.tx_progress.start_epilogue(process.clk()),
-            EpilogueEnd => self.tx_progress.end_epilogue(process.clk()),
+            TransactionEvent::NoteExecutionEnd => {
+                self.tx_progress.end_note_execution(process.clk());
+                Ok(())
+            },
+
+            TransactionEvent::TxScriptProcessingStart => {
+                self.tx_progress.start_tx_script_processing(process.clk());
+                Ok(())
+            }
+            TransactionEvent::TxScriptProcessingEnd => {
+                self.tx_progress.end_tx_script_processing(process.clk());
+                Ok(())
+            }
+
+            TransactionEvent::EpilogueStart => {
+                self.tx_progress.start_epilogue(process.clk());
+                Ok(())
+            }
+            TransactionEvent::EpilogueEnd => {
+                self.tx_progress.end_epilogue(process.clk());
+                Ok(())
+            }
+            TransactionEvent::LinkMapSetEvent => {
+                LinkMap::handle_set_event(process, err_ctx, self.advice_provider_mut())?;
+                Ok(())
+            },
+            TransactionEvent::LinkMapGetEvent => {
+                LinkMap::handle_get_event(process, err_ctx, self.advice_provider_mut())?;
+                Ok(())
+            }
         }
+        .map_err(|err| ExecutionError::event_error(Box::new(err),err_ctx))?;
 
         Ok(())
-    }
-
-    fn on_assert_failed(&mut self, process: ProcessState, err_code: u32) -> ExecutionError {
-        let err_msg = self
-            .error_messages
-            .get(&err_code)
-            .map_or("Unknown error".to_string(), |msg| msg.to_string());
-        ExecutionError::FailedAssertion {
-            clk: process.clk(),
-            err_code,
-            err_msg: Some(err_msg),
-        }
     }
 }
