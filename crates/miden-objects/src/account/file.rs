@@ -8,12 +8,15 @@ use std::{
 
 use miden_crypto::utils::SliceReader;
 
-use super::{
-    super::utils::serde::{
-        ByteReader, ByteWriter, Deserializable, DeserializationError, Serializable,
-    },
-    Account, AuthSecretKey, Word,
+use super::super::utils::serde::{
+    ByteReader,
+    ByteWriter,
+    Deserializable,
+    DeserializationError,
+    Serializable,
 };
+use super::Account;
+use super::auth::AuthSecretKey;
 
 const MAGIC: &str = "acct";
 
@@ -31,21 +34,12 @@ const MAGIC: &str = "acct";
 #[derive(Debug, Clone)]
 pub struct AccountFile {
     pub account: Account,
-    pub account_seed: Option<Word>,
     pub auth_secret_keys: Vec<AuthSecretKey>,
 }
 
 impl AccountFile {
-    pub fn new(
-        account: Account,
-        account_seed: Option<Word>,
-        auth_keys: Vec<AuthSecretKey>,
-    ) -> Self {
-        Self {
-            account,
-            account_seed,
-            auth_secret_keys: auth_keys,
-        }
+    pub fn new(account: Account, auth_keys: Vec<AuthSecretKey>) -> Self {
+        Self { account, auth_secret_keys: auth_keys }
     }
 }
 
@@ -74,14 +68,9 @@ impl AccountFile {
 impl Serializable for AccountFile {
     fn write_into<W: ByteWriter>(&self, target: &mut W) {
         target.write_bytes(MAGIC.as_bytes());
-        let AccountFile {
-            account,
-            account_seed,
-            auth_secret_keys: auth,
-        } = self;
+        let AccountFile { account, auth_secret_keys: auth } = self;
 
         account.write_into(target);
-        account_seed.write_into(target);
         auth.write_into(target);
     }
 }
@@ -95,10 +84,9 @@ impl Deserializable for AccountFile {
             )));
         }
         let account = Account::read_from(source)?;
-        let account_seed = <Option<Word>>::read_from(source)?;
         let auth_secret_keys = <Vec<AuthSecretKey>>::read_from(source)?;
 
-        Ok(Self::new(account, account_seed, auth_secret_keys))
+        Ok(Self::new(account, auth_secret_keys))
     }
 
     fn read_from_bytes(bytes: &[u8]) -> Result<Self, DeserializationError> {
@@ -111,20 +99,16 @@ impl Deserializable for AccountFile {
 
 #[cfg(test)]
 mod tests {
-    use miden_crypto::{
-        dsa::rpo_falcon512::SecretKey,
-        utils::{Deserializable, Serializable},
-    };
+    use miden_crypto::utils::{Deserializable, Serializable};
     use storage::AccountStorage;
     #[cfg(feature = "std")]
     use tempfile::tempdir;
 
     use super::AccountFile;
-    use crate::{
-        account::{Account, AccountCode, AccountId, AuthSecretKey, Felt, Word, storage},
-        asset::AssetVault,
-        testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
-    };
+    use crate::account::auth::AuthSecretKey;
+    use crate::account::{Account, AccountCode, AccountId, Felt, storage};
+    use crate::asset::AssetVault;
+    use crate::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE;
 
     fn build_account_file() -> AccountFile {
         let id = AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE).unwrap();
@@ -133,13 +117,12 @@ mod tests {
         // create account and auth
         let vault = AssetVault::new(&[]).unwrap();
         let storage = AccountStorage::new(vec![]).unwrap();
-        let nonce = Felt::new(0);
-        let account = Account::from_parts(id, vault, storage, code, nonce);
-        let account_seed = Some(Word::default());
-        let auth_secret_key = AuthSecretKey::RpoFalcon512(SecretKey::new());
-        let auth_secret_key_2 = AuthSecretKey::RpoFalcon512(SecretKey::new());
+        let nonce = Felt::new(1);
+        let account = Account::new_existing(id, vault, storage, code, nonce);
+        let auth_secret_key = AuthSecretKey::new_rpo_falcon512();
+        let auth_secret_key_2 = AuthSecretKey::new_rpo_falcon512();
 
-        AccountFile::new(account, account_seed, vec![auth_secret_key, auth_secret_key_2])
+        AccountFile::new(account, vec![auth_secret_key, auth_secret_key_2])
     }
 
     #[test]
@@ -148,7 +131,6 @@ mod tests {
         let serialized = account_file.to_bytes();
         let deserialized = AccountFile::read_from_bytes(&serialized).unwrap();
         assert_eq!(deserialized.account, account_file.account);
-        assert_eq!(deserialized.account_seed, account_file.account_seed);
         assert_eq!(
             deserialized.auth_secret_keys.to_bytes(),
             account_file.auth_secret_keys.to_bytes()
@@ -166,7 +148,6 @@ mod tests {
         let deserialized = AccountFile::read(filepath.as_path()).unwrap();
 
         assert_eq!(deserialized.account, account_file.account);
-        assert_eq!(deserialized.account_seed, account_file.account_seed);
         assert_eq!(
             deserialized.auth_secret_keys.to_bytes(),
             account_file.auth_secret_keys.to_bytes()

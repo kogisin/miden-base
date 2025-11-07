@@ -1,22 +1,19 @@
-use alloc::{borrow::ToOwned, sync::Arc};
+#[cfg(test)]
+use miden_processor::DefaultHost;
+use miden_processor::fast::{ExecutionOutput, FastProcessor};
+use miden_processor::{AdviceInputs, AsyncHost, ExecutionError, Program, StackInputs};
 
-use miden_lib::transaction::TransactionKernel;
-use miden_objects::assembly::SourceManager;
-use vm_processor::{
-    AdviceInputs, AdviceProvider, DefaultHost, ExecutionError, Host, Process, Program, StackInputs,
-};
-
-// MOCK CODE EXECUTOR
+// CODE EXECUTOR
 // ================================================================================================
 
 /// Helper for executing arbitrary code within arbitrary hosts.
-pub struct CodeExecutor<H> {
+pub(crate) struct CodeExecutor<H> {
     host: H,
     stack_inputs: Option<StackInputs>,
     advice_inputs: AdviceInputs,
 }
 
-impl<H: Host> CodeExecutor<H> {
+impl<H: AsyncHost> CodeExecutor<H> {
     // CONSTRUCTOR
     // --------------------------------------------------------------------------------------------
     pub(crate) fn new(host: H) -> Self {
@@ -41,44 +38,60 @@ impl<H: Host> CodeExecutor<H> {
     ///
     /// To improve the error message quality, convert the returned [`ExecutionError`] into a
     /// [`Report`](miden_objects::assembly::diagnostics::Report).
-    pub fn run(self, code: &str) -> Result<Process, ExecutionError> {
-        let assembler = TransactionKernel::testing_assembler().with_debug_mode(true);
-        let source_manager = assembler.source_manager();
+    #[cfg(test)]
+    pub async fn run(self, code: &str) -> Result<ExecutionOutput, ExecutionError> {
+        use alloc::borrow::ToOwned;
+        use alloc::sync::Arc;
+
+        use miden_lib::transaction::TransactionKernel;
+        use miden_objects::assembly::debuginfo::{SourceLanguage, Uri};
+        use miden_objects::assembly::{DefaultSourceManager, SourceManagerSync};
+
+        let source_manager: Arc<dyn SourceManagerSync> = Arc::new(DefaultSourceManager::default());
+        let assembler = TransactionKernel::with_kernel_library(source_manager.clone());
 
         // Virtual file name should be unique.
-        let virtual_source_file = source_manager.load("_user_code", code.to_owned());
+        let virtual_source_file =
+            source_manager.load(SourceLanguage::Masm, Uri::new("_user_code"), code.to_owned());
         let program = assembler.assemble_program(virtual_source_file).unwrap();
 
-        self.execute_program(program, source_manager)
+        self.execute_program(program).await
     }
 
     /// Executes the provided [`Program`] and returns the [`Process`] state.
     ///
     /// To improve the error message quality, convert the returned [`ExecutionError`] into a
     /// [`Report`](miden_objects::assembly::diagnostics::Report).
-    pub fn execute_program(
+    pub async fn execute_program(
         mut self,
         program: Program,
-        source_manager: Arc<dyn SourceManager>,
-    ) -> Result<Process, ExecutionError> {
-        let mut process =
-            Process::new_debug(program.kernel().clone(), self.stack_inputs.unwrap_or_default())
-                .with_source_manager(source_manager);
-        process.execute(&program, &mut self.host)?;
+    ) -> Result<ExecutionOutput, ExecutionError> {
+        // This reverses the stack inputs (even though it doesn't look like it does) because the
+        // fast processor expects the reverse order.
+        //
+        // Once we use the FastProcessor for execution and proving, we can change the way these
+        // inputs are constructed in TransactionKernel::prepare_inputs.
+        let stack_inputs =
+            StackInputs::new(self.stack_inputs.unwrap_or_default().iter().copied().collect())
+                .unwrap();
 
-        Ok(process)
+        let processor = FastProcessor::new_debug(stack_inputs.as_slice(), self.advice_inputs);
+
+        let execution_output = processor.execute(&program, &mut self.host).await?;
+
+        Ok(execution_output)
     }
 }
 
-impl<A> CodeExecutor<DefaultHost<A>>
-where
-    A: AdviceProvider,
-{
-    pub fn with_advice_provider(adv_provider: A) -> Self {
-        let mut host = DefaultHost::new(adv_provider);
+#[cfg(test)]
+impl CodeExecutor<DefaultHost> {
+    pub fn with_default_host() -> Self {
+        use miden_lib::transaction::TransactionKernel;
 
-        let test_lib = TransactionKernel::kernel_as_library();
-        host.load_mast_forest(test_lib.mast_forest().clone()).unwrap();
+        let mut host = DefaultHost::default();
+
+        let test_lib = TransactionKernel::library();
+        host.load_library(test_lib.mast_forest()).unwrap();
 
         CodeExecutor::new(host)
     }

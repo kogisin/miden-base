@@ -7,16 +7,39 @@ use super::{NoteId, RowIndex, TransactionMeasurements};
 
 /// Contains the information about the number of cycles for each of the transaction execution
 /// stages.
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Debug)]
 pub struct TransactionProgress {
     prologue: CycleInterval,
     notes_processing: CycleInterval,
     note_execution: Vec<(NoteId, CycleInterval)>,
     tx_script_processing: CycleInterval,
     epilogue: CycleInterval,
+    auth_procedure: CycleInterval,
+    /// The cycle count of the processor at the point where compute_fee called clk to obtain the
+    /// transaction's cycle count.
+    ///
+    /// This is used to get the total number of cycles the transaction takes for use in
+    /// compute_fee itself.
+    epilogue_after_tx_cycles_obtained: Option<RowIndex>,
 }
 
 impl TransactionProgress {
+    // CONSTRUCTORS
+    // --------------------------------------------------------------------------------------------
+
+    /// Initializes a new [`TransactionProgress`] with all values set to their defaults.
+    pub fn new() -> Self {
+        Self {
+            prologue: CycleInterval::default(),
+            notes_processing: CycleInterval::default(),
+            note_execution: Vec::new(),
+            tx_script_processing: CycleInterval::default(),
+            epilogue: CycleInterval::default(),
+            auth_procedure: CycleInterval::default(),
+            epilogue_after_tx_cycles_obtained: None,
+        }
+    }
+
     // STATE ACCESSORS
     // --------------------------------------------------------------------------------------------
 
@@ -38,6 +61,10 @@ impl TransactionProgress {
 
     pub fn epilogue(&self) -> &CycleInterval {
         &self.epilogue
+    }
+
+    pub fn auth_procedure(&self) -> &CycleInterval {
+        &self.auth_procedure
     }
 
     // STATE MUTATORS
@@ -81,8 +108,26 @@ impl TransactionProgress {
         self.epilogue.set_start(cycle);
     }
 
+    pub fn start_auth_procedure(&mut self, cycle: RowIndex) {
+        self.auth_procedure.set_start(cycle);
+    }
+
+    pub fn end_auth_procedure(&mut self, cycle: RowIndex) {
+        self.auth_procedure.set_end(cycle);
+    }
+
+    pub fn epilogue_after_tx_cycles_obtained(&mut self, cycle: RowIndex) {
+        self.epilogue_after_tx_cycles_obtained = Some(cycle);
+    }
+
     pub fn end_epilogue(&mut self, cycle: RowIndex) {
         self.epilogue.set_end(cycle);
+    }
+}
+
+impl Default for TransactionProgress {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -102,12 +147,26 @@ impl From<TransactionProgress> for TransactionMeasurements {
 
         let epilogue = tx_progress.epilogue().len();
 
+        let auth_procedure = tx_progress.auth_procedure().len();
+
+        // Compute the number of cycles that where not captured by the call to clk.
+        let after_tx_cycles_obtained = if let Some(epilogue_after_tx_cycles_obtained) =
+            tx_progress.epilogue_after_tx_cycles_obtained
+        {
+            tx_progress.epilogue().end().expect("epilogue end should be set")
+                - epilogue_after_tx_cycles_obtained
+        } else {
+            0
+        };
+
         Self {
             prologue,
             notes_processing,
             note_execution,
             tx_script_processing,
             epilogue,
+            auth_procedure,
+            after_tx_cycles_obtained,
         }
     }
 }
@@ -142,13 +201,13 @@ impl CycleInterval {
 
     /// Calculate the length of the interval
     pub fn len(&self) -> usize {
-        if let Some(start) = self.start {
-            if let Some(end) = self.end {
-                if end >= start {
-                    return end - start;
-                }
-            }
+        if let Some(start) = self.start
+            && let Some(end) = self.end
+            && end >= start
+        {
+            return end - start;
         }
+
         0
     }
 }

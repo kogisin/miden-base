@@ -1,14 +1,15 @@
-use alloc::{boxed::Box, string::ToString, vec::Vec};
+use alloc::boxed::Box;
+use alloc::string::ToString;
+use alloc::vec::Vec;
 use core::fmt;
 
+use super::vault::AssetVaultKey;
 use super::{AccountIdPrefix, AccountType, Asset, AssetError, Felt, Hasher, Word};
-use crate::{
-    Digest, FieldElement, WORD_SIZE,
-    utils::{ByteReader, ByteWriter, Deserializable, DeserializationError, Serializable},
-};
+use crate::utils::{ByteReader, ByteWriter, Deserializable, DeserializationError, Serializable};
+use crate::{FieldElement, WORD_SIZE};
 
-/// Position of the faucet_id inside the [`NonFungibleAsset`] word.
-const FAUCET_ID_POS: usize = 3;
+/// Position of the faucet_id inside the [`NonFungibleAsset`] word having fields in BigEndian.
+const FAUCET_ID_POS_BE: usize = 3;
 
 // NON-FUNGIBLE ASSET
 // ================================================================================================
@@ -36,7 +37,7 @@ impl PartialOrd for NonFungibleAsset {
 
 impl Ord for NonFungibleAsset {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        Digest::from(self.0).cmp(&Digest::from(other.0))
+        self.0.cmp(&other.0)
     }
 }
 
@@ -58,7 +59,7 @@ impl NonFungibleAsset {
     /// Returns an error if the provided faucet ID is not for a non-fungible asset faucet.
     pub fn new(details: &NonFungibleAssetDetails) -> Result<Self, AssetError> {
         let data_hash = Hasher::hash(details.asset_data());
-        Self::from_parts(details.faucet_id(), data_hash.into())
+        Self::from_parts(details.faucet_id(), data_hash)
     }
 
     /// Return a non-fungible asset created from the specified faucet and using the provided
@@ -74,7 +75,7 @@ impl NonFungibleAsset {
             return Err(AssetError::NonFungibleFaucetIdTypeMismatch(faucet_id));
         }
 
-        data_hash[FAUCET_ID_POS] = Felt::from(faucet_id);
+        data_hash[FAUCET_ID_POS_BE] = Felt::from(faucet_id);
 
         Ok(Self(data_hash))
     }
@@ -106,22 +107,22 @@ impl NonFungibleAsset {
     /// It also ensures that there is never any collision in the leaf index between a non-fungible
     /// asset and a fungible asset, as the former's vault key always has the fungible bit set to `0`
     /// and the latter's vault key always has the bit set to `1`.
-    pub fn vault_key(&self) -> Word {
+    pub fn vault_key(&self) -> AssetVaultKey {
         let mut vault_key = self.0;
 
         // Swap prefix of faucet ID with hash0.
-        vault_key.swap(0, FAUCET_ID_POS);
+        vault_key.swap(0, FAUCET_ID_POS_BE);
 
         // Set the fungible bit to zero.
         vault_key[3] =
             AccountIdPrefix::clear_fungible_bit(self.faucet_id_prefix().version(), vault_key[3]);
 
-        vault_key
+        AssetVaultKey::new_unchecked(vault_key)
     }
 
     /// Return ID prefix of the faucet which issued this asset.
     pub fn faucet_id_prefix(&self) -> AccountIdPrefix {
-        AccountIdPrefix::new_unchecked(self.0[FAUCET_ID_POS])
+        AccountIdPrefix::new_unchecked(self.0[FAUCET_ID_POS_BE])
     }
 
     // HELPER FUNCTIONS
@@ -133,7 +134,7 @@ impl NonFungibleAsset {
     /// - The faucet_id is not a valid non-fungible faucet ID.
     /// - The most significant bit of the asset is not ZERO.
     fn validate(&self) -> Result<(), AssetError> {
-        let faucet_id = AccountIdPrefix::try_from(self.0[FAUCET_ID_POS])
+        let faucet_id = AccountIdPrefix::try_from(self.0[FAUCET_ID_POS_BE])
             .map_err(|err| AssetError::InvalidFaucetAccountId(Box::new(err)))?;
 
         let account_type = faucet_id.account_type();
@@ -213,8 +214,11 @@ impl NonFungibleAsset {
 
         // The last felt in the data_hash will be replaced by the faucet id, so we can set it to
         // zero here.
-        NonFungibleAsset::from_parts(faucet_id_prefix, [hash_0, hash_1, hash_2, Felt::ZERO])
-            .map_err(|err| DeserializationError::InvalidValue(err.to_string()))
+        NonFungibleAsset::from_parts(
+            faucet_id_prefix,
+            Word::from([hash_0, hash_1, hash_2, Felt::ZERO]),
+        )
+        .map_err(|err| DeserializationError::InvalidValue(err.to_string()))
     }
 }
 
@@ -262,12 +266,12 @@ mod tests {
     use assert_matches::assert_matches;
 
     use super::*;
-    use crate::{
-        account::AccountId,
-        testing::account_id::{
-            ACCOUNT_ID_PRIVATE_FUNGIBLE_FAUCET, ACCOUNT_ID_PRIVATE_NON_FUNGIBLE_FAUCET,
-            ACCOUNT_ID_PUBLIC_NON_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_NON_FUNGIBLE_FAUCET_1,
-        },
+    use crate::account::AccountId;
+    use crate::testing::account_id::{
+        ACCOUNT_ID_PRIVATE_FUNGIBLE_FAUCET,
+        ACCOUNT_ID_PRIVATE_NON_FUNGIBLE_FAUCET,
+        ACCOUNT_ID_PUBLIC_NON_FUNGIBLE_FAUCET,
+        ACCOUNT_ID_PUBLIC_NON_FUNGIBLE_FAUCET_1,
     };
 
     #[test]

@@ -1,15 +1,52 @@
-use alloc::{collections::BTreeSet, vec::Vec};
+use alloc::collections::BTreeSet;
+use alloc::vec::Vec;
 
-use assembly::{Assembler, Compile, Library};
-use vm_processor::{Digest, MastForest};
+use miden_assembly::ast::QualifiedProcedureName;
+use miden_assembly::{Assembler, Library, Parse};
+use miden_core::utils::Deserializable;
+use miden_mast_package::{Package, SectionId};
+use miden_processor::MastForest;
 
 mod template;
 pub use template::*;
 
-use crate::{
-    AccountError,
-    account::{AccountType, StorageSlot},
-};
+use crate::account::{AccountType, StorageSlot};
+use crate::{AccountError, Word};
+
+// IMPLEMENTATIONS
+// ================================================================================================
+
+impl TryFrom<Package> for AccountComponentTemplate {
+    type Error = AccountError;
+
+    fn try_from(package: Package) -> Result<Self, Self::Error> {
+        let library = package.unwrap_library().as_ref().clone();
+
+        // Look for account component metadata in sections
+        let metadata = package
+            .sections
+            .iter()
+            .find_map(|section| {
+                (section.id == SectionId::ACCOUNT_COMPONENT_METADATA).then(|| {
+                        AccountComponentMetadata::read_from_bytes(&section.data)
+                            .map_err(|err| {
+                                AccountError::other_with_source(
+                                    "failed to deserialize account component metadata",
+                                    err,
+                                )
+                            })
+                })
+            })
+            .transpose()?
+            .ok_or_else(|| {
+                AccountError::other(
+                    "package does not contain account component metadata section - packages without explicit metadata may be intended for other purposes (e.g., note scripts, transaction scripts)",
+                )
+            })?;
+
+        Ok(AccountComponentTemplate::new(metadata, library))
+    }
+}
 
 /// An [`AccountComponent`] defines a [`Library`] of code and the initial value and types of
 /// the [`StorageSlot`]s it accesses.
@@ -75,7 +112,7 @@ impl AccountComponent {
     /// - the compilation of the provided source code fails.
     /// - The number of storage slots exceeds 255.
     pub fn compile(
-        source_code: impl Compile,
+        source_code: impl Parse,
         assembler: Assembler,
         storage_slots: Vec<StorageSlot>,
     ) -> Result<Self, AccountError> {
@@ -110,6 +147,31 @@ impl AccountComponent {
 
         Ok(AccountComponent::new(template.library().clone(), storage_slots)?
             .with_supported_types(template.metadata().supported_types().clone()))
+    }
+
+    /// Creates an [`AccountComponent`] from a [`Package`] using [`InitStorageData`].
+    ///
+    /// This method provides type safety by leveraging the component's metadata to validate
+    /// storage initialization data. The package must contain explicit account component metadata.
+    ///
+    /// # Arguments
+    ///
+    /// * `package` - The package containing the library and account component metadata
+    /// * `init_storage_data` - The initialization data for storage slots
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The package does not contain account component metadata
+    /// - The package cannot be converted to an [`AccountComponentTemplate`]
+    /// - The storage initialization fails due to invalid or missing data
+    /// - The component creation fails
+    pub fn from_package_with_init_data(
+        package: &Package,
+        init_storage_data: &InitStorageData,
+    ) -> Result<Self, AccountError> {
+        let template = AccountComponentTemplate::try_from(package.clone())?;
+        Self::from_template(&template, init_storage_data)
     }
 
     // ACCESSORS
@@ -147,15 +209,24 @@ impl AccountComponent {
     }
 
     /// Returns a vector of tuples (digest, is_auth) for all procedures in this component.
-    pub(crate) fn get_procedures(&self) -> Vec<(Digest, bool)> {
+    pub fn get_procedures(&self) -> Vec<(Word, bool)> {
         let mut procedures = Vec::new();
         for module in self.library.module_infos() {
             for (_, procedure_info) in module.procedures() {
-                let is_auth = procedure_info.name.contains("auth__");
+                let is_auth = procedure_info.name.starts_with("auth_");
                 procedures.push((procedure_info.digest, is_auth));
             }
         }
         procedures
+    }
+
+    /// Returns the digest of the procedure with the specified name, or `None` if it was not found
+    /// in this component's library or its library path is malformed.
+    pub fn get_procedure_root_by_name(
+        &self,
+        proc_name: impl TryInto<QualifiedProcedureName>,
+    ) -> Option<Word> {
+        self.library.get_procedure_root_by_name(proc_name)
     }
 
     // MUTATORS
@@ -194,5 +265,134 @@ impl AccountComponent {
 impl From<AccountComponent> for Library {
     fn from(component: AccountComponent) -> Self {
         component.library
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::collections::BTreeSet;
+    use alloc::string::ToString;
+    use alloc::sync::Arc;
+
+    use miden_assembly::Assembler;
+    use miden_core::utils::Serializable;
+    use miden_mast_package::{MastArtifact, Package, PackageManifest, Section};
+    use semver::Version;
+
+    use super::*;
+    use crate::testing::account_code::CODE;
+
+    #[test]
+    fn test_try_from_package_for_template() {
+        // Create a simple library for testing
+        let library = Assembler::default().assemble_library([CODE]).unwrap();
+
+        // Test with metadata
+        let metadata = AccountComponentMetadata::new(
+            "test_component".to_string(),
+            "A test component".to_string(),
+            Version::new(1, 0, 0),
+            BTreeSet::from_iter([AccountType::RegularAccountImmutableCode]),
+            vec![],
+        )
+        .unwrap();
+
+        let metadata_bytes = metadata.to_bytes();
+        let package_with_metadata = Package {
+            name: "test_package".to_string(),
+            mast: MastArtifact::Library(Arc::new(library.clone())),
+            manifest: PackageManifest::new(None),
+
+            sections: vec![Section::new(
+                SectionId::ACCOUNT_COMPONENT_METADATA,
+                metadata_bytes.clone(),
+            )],
+            version: Default::default(),
+            description: None,
+        };
+
+        let template = AccountComponentTemplate::try_from(package_with_metadata).unwrap();
+        assert_eq!(template.metadata().name(), "test_component");
+        assert!(
+            template
+                .metadata()
+                .supported_types()
+                .contains(&AccountType::RegularAccountImmutableCode)
+        );
+
+        // Test without metadata - should fail
+        let package_without_metadata = Package {
+            name: "test_package_no_metadata".to_string(),
+            mast: MastArtifact::Library(Arc::new(library)),
+            manifest: PackageManifest::new(None),
+            sections: vec![], // No metadata section
+            version: Default::default(),
+            description: None,
+        };
+
+        let result = AccountComponentTemplate::try_from(package_without_metadata);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("package does not contain account component metadata"));
+    }
+
+    #[test]
+    fn test_from_package_with_init_data() {
+        // Create a simple library for testing
+        let library = Assembler::default().assemble_library([CODE]).unwrap();
+
+        // Create metadata for the component
+        let metadata = AccountComponentMetadata::new(
+            "test_component".to_string(),
+            "A test component".to_string(),
+            Version::new(1, 0, 0),
+            BTreeSet::from_iter([
+                AccountType::RegularAccountImmutableCode,
+                AccountType::RegularAccountUpdatableCode,
+            ]),
+            vec![],
+        )
+        .unwrap();
+
+        // Create a package with metadata
+        let package = Package {
+            name: "test_package_init_data".to_string(),
+            mast: MastArtifact::Library(Arc::new(library.clone())),
+            manifest: PackageManifest::new(None),
+            sections: vec![Section::new(
+                SectionId::ACCOUNT_COMPONENT_METADATA,
+                metadata.to_bytes(),
+            )],
+            version: Default::default(),
+            description: None,
+        };
+
+        // Test with empty init data - this tests the complete workflow:
+        // Package -> AccountComponentTemplate -> AccountComponent
+        let init_data = InitStorageData::default();
+        let component =
+            AccountComponent::from_package_with_init_data(&package, &init_data).unwrap();
+
+        // Verify the component was created correctly
+        assert_eq!(component.storage_size(), 0);
+        assert!(component.supports_type(AccountType::RegularAccountImmutableCode));
+        assert!(component.supports_type(AccountType::RegularAccountUpdatableCode));
+        assert!(!component.supports_type(AccountType::FungibleFaucet));
+
+        // Test without metadata - should fail
+        let package_without_metadata = Package {
+            name: "test_package_no_metadata".to_string(),
+            mast: MastArtifact::Library(Arc::new(library)),
+            manifest: PackageManifest::new(None),
+            sections: vec![], // No metadata section
+            version: Default::default(),
+            description: None,
+        };
+
+        let result =
+            AccountComponent::from_package_with_init_data(&package_without_metadata, &init_data);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("package does not contain account component metadata"));
     }
 }

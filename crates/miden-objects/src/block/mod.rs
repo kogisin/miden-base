@@ -1,5 +1,5 @@
 mod header;
-pub use header::BlockHeader;
+pub use header::{BlockHeader, FeeParameters};
 
 mod block_number;
 pub use block_number::BlockNumber;
@@ -16,8 +16,7 @@ pub use nullifier_witness::NullifierWitness;
 mod partial_account_tree;
 pub use partial_account_tree::PartialAccountTree;
 
-pub(super) mod account_tree;
-pub use account_tree::AccountTree;
+pub mod account_tree;
 
 mod nullifier_tree;
 pub use nullifier_tree::NullifierTree;

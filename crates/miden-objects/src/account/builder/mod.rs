@@ -1,16 +1,21 @@
-use alloc::{boxed::Box, vec::Vec};
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 
-use vm_core::FieldElement;
-use vm_processor::Digest;
+use miden_core::FieldElement;
 
-use crate::{
-    AccountError, Felt, Word,
-    account::{
-        Account, AccountCode, AccountComponent, AccountId, AccountIdV0, AccountIdVersion,
-        AccountStorage, AccountStorageMode, AccountType,
-    },
-    asset::AssetVault,
+use crate::account::{
+    Account,
+    AccountCode,
+    AccountComponent,
+    AccountId,
+    AccountIdV0,
+    AccountIdVersion,
+    AccountStorage,
+    AccountStorageMode,
+    AccountType,
 };
+use crate::asset::AssetVault;
+use crate::{AccountError, Felt, Word};
 
 /// A convenient builder for an [`Account`] allowing for safe construction of an account by
 /// combining multiple [`AccountComponent`]s.
@@ -33,7 +38,7 @@ use crate::{
 ///
 /// Under the `testing` feature, it is possible to:
 /// - Build an existing account using [`AccountBuilder::build_existing`] which will set the
-///   account's nonce to `1`.
+///   account's nonce to `1` by default, or to the configured value.
 /// - Add assets to the account's vault, however this will only succeed when using
 ///   [`AccountBuilder::build_existing`].
 ///
@@ -51,6 +56,8 @@ use crate::{
 pub struct AccountBuilder {
     #[cfg(any(feature = "testing", test))]
     assets: Vec<crate::asset::Asset>,
+    #[cfg(any(feature = "testing", test))]
+    nonce: Option<Felt>,
     components: Vec<AccountComponent>,
     auth_component: Option<AccountComponent>,
     account_type: AccountType,
@@ -68,6 +75,8 @@ impl AccountBuilder {
         Self {
             #[cfg(any(feature = "testing", test))]
             assets: vec![],
+            #[cfg(any(feature = "testing", test))]
+            nonce: None,
             components: vec![],
             auth_component: None,
             init_seed,
@@ -107,7 +116,7 @@ impl AccountBuilder {
     /// Adds a designated authentication [`AccountComponent`] to the builder.
     ///
     /// This component may contain multiple procedures, but is expected to contain exactly one
-    /// authentication procedure (named `auth__*`).
+    /// authentication procedure (named `auth_*`).
     /// Calling this method multiple times will override the previous auth component.
     ///
     /// Procedures from this component will be placed at the beginning of the account procedure
@@ -151,8 +160,8 @@ impl AccountBuilder {
         &self,
         init_seed: [u8; 32],
         version: AccountIdVersion,
-        code_commitment: Digest,
-        storage_commitment: Digest,
+        code_commitment: Word,
+        storage_commitment: Word,
     ) -> Result<Word, AccountError> {
         let seed = AccountIdV0::compute_account_seed(
             init_seed,
@@ -182,10 +191,10 @@ impl AccountBuilder {
     /// - Authentication component is missing.
     /// - Multiple authentication procedures are found.
     /// - The number of [`StorageSlot`](crate::account::StorageSlot)s of all components exceeds 255.
-    /// - [`MastForest::merge`](vm_processor::MastForest::merge) fails on the given components.
+    /// - [`MastForest::merge`](miden_processor::MastForest::merge) fails on the given components.
     /// - If duplicate assets were added to the builder (only under the `testing` feature).
     /// - If the vault is not empty on new accounts (only under the `testing` feature).
-    pub fn build(mut self) -> Result<(Account, Word), AccountError> {
+    pub fn build(mut self) -> Result<Account, AccountError> {
         let (vault, code, storage) = self.build_inner()?;
 
         #[cfg(any(feature = "testing", test))]
@@ -214,9 +223,12 @@ impl AccountBuilder {
         debug_assert_eq!(account_id.account_type(), self.account_type);
         debug_assert_eq!(account_id.storage_mode(), self.storage_mode);
 
-        let account = Account::from_parts(account_id, vault, storage, code, Felt::ZERO);
+        // SAFETY: The account ID was derived from the seed and the seed is provided, so it is safe
+        // to bypass the checks of `Account::new`.
+        let account =
+            Account::new_unchecked(account_id, vault, storage, code, Felt::ZERO, Some(seed));
 
-        Ok((account, seed))
+        Ok(account)
     }
 }
 
@@ -228,6 +240,15 @@ impl AccountBuilder {
     /// accounts must have an empty vault.
     pub fn with_assets<I: IntoIterator<Item = crate::asset::Asset>>(mut self, assets: I) -> Self {
         self.assets.extend(assets);
+        self
+    }
+
+    /// Sets the nonce of an existing account.
+    ///
+    /// This method is optional. It must only be used when using [`Self::build_existing`]
+    /// instead of [`Self::build`] since new accounts must have a nonce of `0`.
+    pub fn nonce(mut self, nonce: Felt) -> Self {
+        self.nonce = Some(nonce);
         self
     }
 
@@ -250,7 +271,10 @@ impl AccountBuilder {
             )
         };
 
-        Ok(Account::from_parts(account_id, vault, storage, code, Felt::ONE))
+        // Use the nonce value set by the Self::nonce method or Felt::ONE as a default.
+        let nonce = self.nonce.unwrap_or(Felt::ONE);
+
+        Ok(Account::new_existing(account_id, vault, storage, code, nonce))
     }
 }
 
@@ -261,12 +285,14 @@ impl AccountBuilder {
 mod tests {
     use std::sync::LazyLock;
 
-    use assembly::{Assembler, Library};
     use assert_matches::assert_matches;
-    use vm_core::FieldElement;
+    use miden_assembly::{Assembler, Library};
+    use miden_core::FieldElement;
+    use miden_processor::MastNodeExt;
 
     use super::*;
-    use crate::{account::StorageSlot, testing::account_component::NoopAuthComponent};
+    use crate::account::StorageSlot;
+    use crate::testing::noop_auth_component::NoopAuthComponent;
 
     const CUSTOM_CODE1: &str = "
           export.foo
@@ -295,7 +321,7 @@ mod tests {
     }
     impl From<CustomComponent1> for AccountComponent {
         fn from(custom: CustomComponent1) -> Self {
-            let mut value = Word::default();
+            let mut value = Word::empty();
             value[0] = Felt::new(custom.slot0);
 
             AccountComponent::new(CUSTOM_LIBRARY1.clone(), vec![StorageSlot::Value(value)])
@@ -310,9 +336,9 @@ mod tests {
     }
     impl From<CustomComponent2> for AccountComponent {
         fn from(custom: CustomComponent2) -> Self {
-            let mut value0 = Word::default();
+            let mut value0 = Word::empty();
             value0[3] = Felt::new(custom.slot0);
-            let mut value1 = Word::default();
+            let mut value1 = Word::empty();
             value1[3] = Felt::new(custom.slot1);
 
             AccountComponent::new(
@@ -330,8 +356,8 @@ mod tests {
         let storage_slot1 = 12;
         let storage_slot2 = 42;
 
-        let (account, seed) = Account::builder([5; 32])
-            .with_auth_component(NoopAuthComponent::new(Assembler::default()).unwrap())
+        let account = Account::builder([5; 32])
+            .with_auth_component(NoopAuthComponent)
             .with_component(CustomComponent1 { slot0: storage_slot0 })
             .with_component(CustomComponent2 {
                 slot0: storage_slot1,
@@ -344,7 +370,7 @@ mod tests {
         assert_eq!(account.nonce(), Felt::ZERO);
 
         let computed_id = AccountId::new(
-            seed,
+            account.seed().unwrap(),
             AccountIdVersion::Version0,
             account.code.commitment(),
             account.storage.commitment(),
@@ -356,10 +382,10 @@ mod tests {
         assert_eq!(account.code.procedure_roots().count(), 3);
 
         let foo_root = CUSTOM_LIBRARY1.mast_forest()
-            [CUSTOM_LIBRARY1.get_export_node_id(CUSTOM_LIBRARY1.exports().next().unwrap())]
+            [CUSTOM_LIBRARY1.get_export_node_id(&CUSTOM_LIBRARY1.exports().next().unwrap().name)]
         .digest();
         let bar_root = CUSTOM_LIBRARY2.mast_forest()
-            [CUSTOM_LIBRARY2.get_export_node_id(CUSTOM_LIBRARY2.exports().next().unwrap())]
+            [CUSTOM_LIBRARY2.get_export_node_id(&CUSTOM_LIBRARY2.exports().next().unwrap().name)]
         .digest();
 
         let foo_procedure_info = &account
@@ -399,7 +425,7 @@ mod tests {
         let storage_slot0 = 25;
 
         let build_error = Account::builder([0xff; 32])
-            .with_auth_component(NoopAuthComponent::new(Assembler::default()).unwrap())
+            .with_auth_component(NoopAuthComponent)
             .with_component(CustomComponent1 { slot0: storage_slot0 })
             .with_assets(AssetVault::mock().assets())
             .build()

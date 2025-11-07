@@ -1,30 +1,45 @@
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::error::Error;
 
-use assembly::{Report, diagnostics::reporting::PrintDiagnostic};
-use miden_crypto::{merkle::MmrError, utils::HexParseError};
+use miden_assembly::Report;
+use miden_assembly::diagnostics::reporting::PrintDiagnostic;
+use miden_core::Felt;
+use miden_core::mast::MastForestError;
+use miden_crypto::merkle::MmrError;
+use miden_crypto::utils::HexParseError;
+use miden_processor::DeserializationError;
 use thiserror::Error;
-use vm_core::{Felt, FieldElement, mast::MastForestError};
-use vm_processor::DeserializationError;
 
-use super::{
-    Digest, MAX_BATCHES_PER_BLOCK, MAX_OUTPUT_NOTES_PER_BATCH, Word,
-    account::AccountId,
-    asset::{FungibleAsset, NonFungibleAsset, TokenSymbol},
-    crypto::merkle::MerkleError,
-    note::NoteId,
+use super::account::AccountId;
+use super::asset::{FungibleAsset, NonFungibleAsset, TokenSymbol};
+use super::crypto::merkle::MerkleError;
+use super::note::NoteId;
+use super::{MAX_BATCHES_PER_BLOCK, MAX_OUTPUT_NOTES_PER_BATCH, Word};
+use crate::account::{
+    AccountCode,
+    AccountIdPrefix,
+    AccountStorage,
+    AccountType,
+    SlotName,
+    StorageValueName,
+    StorageValueNameError,
+    TemplateTypeError,
 };
+use crate::address::AddressType;
+use crate::asset::AssetVaultKey;
+use crate::batch::BatchId;
+use crate::block::BlockNumber;
+use crate::note::{NoteAssets, NoteExecutionHint, NoteTag, NoteType, Nullifier};
+use crate::transaction::TransactionId;
 use crate::{
-    ACCOUNT_UPDATE_MAX_SIZE, MAX_ACCOUNTS_PER_BATCH, MAX_INPUT_NOTES_PER_BATCH,
-    MAX_INPUT_NOTES_PER_TX, MAX_INPUTS_PER_NOTE, MAX_OUTPUT_NOTES_PER_TX,
-    account::{
-        AccountCode, AccountIdPrefix, AccountStorage, AccountType, AddressType, StorageValueName,
-        StorageValueNameError, TemplateTypeError,
-    },
-    batch::BatchId,
-    block::BlockNumber,
-    note::{NoteAssets, NoteExecutionHint, NoteTag, NoteType, Nullifier},
-    transaction::TransactionId,
+    ACCOUNT_UPDATE_MAX_SIZE,
+    MAX_ACCOUNTS_PER_BATCH,
+    MAX_INPUT_NOTES_PER_BATCH,
+    MAX_INPUT_NOTES_PER_TX,
+    MAX_INPUTS_PER_NOTE,
+    MAX_OUTPUT_NOTES_PER_TX,
 };
 
 // ACCOUNT COMPONENT TEMPLATE ERROR
@@ -82,17 +97,17 @@ pub enum AccountError {
     #[error("account code contains {0} procedures but it may contain at most {max} procedures", max = AccountCode::MAX_NUM_PROCEDURES)]
     AccountCodeTooManyProcedures(usize),
     #[error("account procedure {0}'s storage offset {1} does not fit into u8")]
-    AccountCodeProcedureStorageOffsetTooLarge(Digest, Felt),
+    AccountCodeProcedureStorageOffsetTooLarge(Word, Felt),
     #[error("account procedure {0}'s storage size {1} does not fit into u8")]
-    AccountCodeProcedureStorageSizeTooLarge(Digest, Felt),
+    AccountCodeProcedureStorageSizeTooLarge(Word, Felt),
     #[error("account procedure {0}'s final two elements must be Felt::ZERO")]
-    AccountCodeProcedureInvalidPadding(Digest),
+    AccountCodeProcedureInvalidPadding(Word),
     #[error("failed to assemble account component:\n{}", PrintDiagnostic::new(.0))]
     AccountComponentAssemblyError(Report),
     #[error("failed to merge components into one account code mast forest")]
     AccountComponentMastForestMergeError(#[source] MastForestError),
     #[error("procedure with MAST root {0} is present in multiple account components")]
-    AccountComponentDuplicateProcedureRoot(Digest),
+    AccountComponentDuplicateProcedureRoot(Word),
     #[error("failed to create account component")]
     AccountComponentTemplateInstantiationError(#[source] AccountComponentTemplateError),
     #[error("account component contains multiple authentication procedures")]
@@ -105,7 +120,7 @@ pub enum AccountError {
     FinalAccountHeaderIdParsingFailed(#[source] AccountIdError),
     #[error("account header data has length {actual} but it must be of length {expected}")]
     HeaderDataIncorrectLength { actual: usize, expected: usize },
-    #[error("current account nonce {current} plus increment {increment} overflows a felt to {new}")]
+    #[error("active account nonce {current} plus increment {increment} overflows a felt to {new}")]
     NonceOverflow {
         current: Felt,
         increment: Felt,
@@ -115,6 +130,20 @@ pub enum AccountError {
         "digest of the seed has {actual} trailing zeroes but must have at least {expected} trailing zeroes"
     )]
     SeedDigestTooFewTrailingZeros { expected: u32, actual: u32 },
+    #[error("account ID {actual} computed from seed does not match ID {expected} on account")]
+    AccountIdSeedMismatch { actual: AccountId, expected: AccountId },
+    #[error("account ID seed was provided for an existing account")]
+    ExistingAccountWithSeed,
+    #[error("account ID seed was not provided for a new account")]
+    NewAccountMissingSeed,
+    #[error(
+        "an account with a seed cannot be converted into a delta since it represents an unregistered account"
+    )]
+    DeltaFromAccountWithSeed,
+    #[error("seed converts to an invalid account ID")]
+    SeedConvertsToInvalidAccountId(#[source] AccountIdError),
+    #[error("storage map root {0} not found in the account storage")]
+    StorageMapRootNotFound(Word),
     #[error("storage slot at index {0} is not of type map")]
     StorageSlotNotMap(u8),
     #[error("storage slot at index {0} is not of type value")]
@@ -138,10 +167,43 @@ pub enum AccountError {
         account_type: AccountType,
         component_index: usize,
     },
+    #[error(
+        "failed to apply full state delta to existing account; full state deltas can be converted to accounts directly"
+    )]
+    ApplyFullStateDeltaToAccount,
+    #[error("only account deltas representing a full account can be converted to a full account")]
+    PartialStateDeltaToAccount,
+    #[error("maximum number of storage map leaves exceeded")]
+    MaxNumStorageMapLeavesExceeded(#[source] MerkleError),
     /// This variant can be used by methods that are not inherent to the account but want to return
     /// this error type.
-    #[error("assumption violated: {0}")]
-    AssumptionViolated(String),
+    #[error("{error_msg}")]
+    Other {
+        error_msg: Box<str>,
+        // thiserror will return this when calling Error::source on AccountError.
+        source: Option<Box<dyn Error + Send + Sync + 'static>>,
+    },
+}
+
+impl AccountError {
+    /// Creates a custom error using the [`AccountError::Other`] variant from an error message.
+    pub fn other(message: impl Into<String>) -> Self {
+        let message: String = message.into();
+        Self::Other { error_msg: message.into(), source: None }
+    }
+
+    /// Creates a custom error using the [`AccountError::Other`] variant from an error message and
+    /// a source error.
+    pub fn other_with_source(
+        message: impl Into<String>,
+        source: impl Error + Send + Sync + 'static,
+    ) -> Self {
+        let message: String = message.into();
+        Self::Other {
+            error_msg: message.into(),
+            source: Some(Box::new(source)),
+        }
+    }
 }
 
 // ACCOUNT ID ERROR
@@ -169,6 +231,24 @@ pub enum AccountIdError {
     Bech32DecodeError(#[source] Bech32Error),
 }
 
+// SLOT NAME ERROR
+// ================================================================================================
+
+#[derive(Debug, Error)]
+pub enum SlotNameError {
+    #[error("slot names must only contain characters a..z, A..Z, 0..9 or underscore")]
+    InvalidCharacter,
+    #[error("slot names must be separated by double colons")]
+    UnexpectedColon,
+    #[error("slot name components must not start with an underscore")]
+    UnexpectedUnderscore,
+    #[error(
+        "slot names must contain at least {} components separated by double colons",
+        SlotName::MIN_NUM_COMPONENTS
+    )]
+    TooShort,
+}
+
 // ACCOUNT TREE ERROR
 // ================================================================================================
 
@@ -188,10 +268,64 @@ pub enum AccountTreeError {
     TreeRootConflict(#[source] MerkleError),
     #[error("failed to apply mutations to account tree")]
     ApplyMutations(#[source] MerkleError),
+    #[error("failed to compute account tree mutations")]
+    ComputeMutations(#[source] MerkleError),
     #[error("smt leaf's index is not a valid account ID prefix")]
     InvalidAccountIdPrefix(#[source] AccountIdError),
     #[error("account witness merkle path depth {0} does not match AccountTree::DEPTH")]
     WitnessMerklePathDepthDoesNotMatchAccountTreeDepth(usize),
+}
+
+// ADDRESS ERROR
+// ================================================================================================
+
+#[derive(Debug, Error)]
+pub enum AddressError {
+    #[error("tag length {0} should be {expected} bits for network accounts",
+        expected = NoteTag::DEFAULT_NETWORK_TAG_LENGTH
+    )]
+    CustomTagLengthNotAllowedForNetworkAccounts(u8),
+    #[error("tag length {0} is too large, must be less than or equal to {max}",
+        max = NoteTag::MAX_LOCAL_TAG_LENGTH
+    )]
+    TagLengthTooLarge(u8),
+    #[error("unknown address interface `{0}`")]
+    UnknownAddressInterface(u16),
+    #[error("failed to decode account ID")]
+    AccountIdDecodeError(#[source] AccountIdError),
+    #[error("address separator must not be included without routing parameters")]
+    TrailingSeparator,
+    #[error("failed to decode bech32 string into an address")]
+    Bech32DecodeError(#[source] Bech32Error),
+    #[error("{error_msg}")]
+    DecodeError {
+        error_msg: Box<str>,
+        // thiserror will return this when calling Error::source on NoteError.
+        source: Option<Box<dyn Error + Send + Sync + 'static>>,
+    },
+    #[error("found unknown routing parameter key {0}")]
+    UnknownRoutingParameterKey(u8),
+}
+
+impl AddressError {
+    /// Creates an [`AddressError::DecodeError`] variant from an error message.
+    pub fn decode_error(message: impl Into<String>) -> Self {
+        let message: String = message.into();
+        Self::DecodeError { error_msg: message.into(), source: None }
+    }
+
+    /// Creates an [`AddressError::DecodeError`] variant from an error message and
+    /// a source error.
+    pub fn decode_error_with_source(
+        message: impl Into<String>,
+        source: impl Error + Send + Sync + 'static,
+    ) -> Self {
+        let message: String = message.into();
+        Self::DecodeError {
+            error_msg: message.into(),
+            source: Some(Box::new(source)),
+        }
+    }
 }
 
 // BECH32 ERROR
@@ -199,8 +333,8 @@ pub enum AccountTreeError {
 
 #[derive(Debug, Error)]
 pub enum Bech32Error {
-    #[error("failed to decode bech32 string")]
-    DecodeError(#[source] Box<dyn Error + Send + Sync + 'static>),
+    #[error(transparent)]
+    DecodeError(Box<dyn Error + Send + Sync + 'static>),
     #[error("found unknown address type {0} which is not the expected {account_addr} account ID address type",
       account_addr = AddressType::AccountId as u8
     )]
@@ -251,8 +385,8 @@ pub enum AccountDeltaError {
         account_id: AccountId,
         source: AccountError,
     },
-    #[error("zero nonce is not allowed for non-empty account deltas")]
-    ZeroNonceForNonEmptyDelta,
+    #[error("non-empty account storage or vault delta with zero nonce delta is not allowed")]
+    NonEmptyStorageOrVaultDeltaWithZeroNonceDelta,
     #[error(
         "account nonce increment {current} plus the other nonce increment {increment} overflows a felt to {new}"
     )]
@@ -263,6 +397,8 @@ pub enum AccountDeltaError {
     },
     #[error("account ID {0} in fungible asset delta is not of type fungible faucet")]
     NotAFungibleFaucetId(AccountId),
+    #[error("cannot merge two full state deltas")]
+    MergingFullStateDeltas,
 }
 
 // STORAGE MAP ERROR
@@ -270,11 +406,10 @@ pub enum AccountDeltaError {
 
 #[derive(Debug, Error)]
 pub enum StorageMapError {
-    #[error("map entries contain key {key} twice with values {value0} and {value1}",
-      value0 = vm_core::utils::to_hex(Felt::elements_as_bytes(value0)),
-      value1 = vm_core::utils::to_hex(Felt::elements_as_bytes(value1))
-    )]
-    DuplicateKey { key: Digest, value0: Word, value1: Word },
+    #[error("map entries contain key {key} twice with values {value0} and {value1}")]
+    DuplicateKey { key: Word, value0: Word, value1: Word },
+    #[error("map key {raw_key} is not present in provided SMT proof")]
+    MissingKey { raw_key: Word },
 }
 
 // BATCH ACCOUNT UPDATE ERROR
@@ -308,11 +443,9 @@ pub enum AssetError {
       max_amount = FungibleAsset::MAX_AMOUNT
     )]
     FungibleAssetAmountTooBig(u64),
-    #[error("subtracting {subtrahend} from fungible asset amount {minuend} would overflow")]
+    #[error("subtracting {subtrahend} from fungible asset amount {minuend} would underflow")]
     FungibleAssetAmountNotSufficient { minuend: u64, subtrahend: u64 },
-    #[error("fungible asset word {hex} does not contain expected ZERO at word index 1",
-      hex = vm_core::utils::to_hex(Felt::elements_as_bytes(.0))
-    )]
+    #[error("fungible asset word {0} does not contain expected ZERO at word index 1")]
     FungibleAssetExpectedZero(Word),
     #[error(
         "cannot add fungible asset with issuer {other_issuer} to fungible asset with issuer {original_issuer}"
@@ -323,6 +456,8 @@ pub enum AssetError {
     },
     #[error("faucet account ID in asset is invalid")]
     InvalidFaucetAccountId(#[source] Box<dyn Error + Send + Sync + 'static>),
+    #[error("faucet account ID in asset has a non-faucet prefix: {}", .0)]
+    InvalidFaucetAccountIdPrefix(AccountIdPrefix),
     #[error(
       "faucet id {0} of type {id_type} must be of type {expected_ty} for fungible assets",
       id_type = .0.account_type(),
@@ -335,6 +470,8 @@ pub enum AssetError {
       expected_ty = AccountType::NonFungibleFaucet
     )]
     NonFungibleFaucetIdTypeMismatch(AccountIdPrefix),
+    #[error("asset vault key {actual} does not match expected asset vault key {expected}")]
+    AssetVaultKeyMismatch { actual: Word, expected: Word },
 }
 
 // TOKEN SYMBOL ERROR
@@ -371,6 +508,23 @@ pub enum AssetVaultError {
     NonFungibleAssetNotFound(NonFungibleAsset),
     #[error("subtracting fungible asset amounts would underflow")]
     SubtractFungibleAssetBalanceError(#[source] AssetError),
+    #[error("maximum number of asset vault leaves exceeded")]
+    MaxLeafEntriesExceeded(#[source] MerkleError),
+}
+
+// PARTIAL ASSET VAULT ERROR
+// ================================================================================================
+
+#[derive(Debug, Error)]
+pub enum PartialAssetVaultError {
+    #[error("provided SMT entry {entry} is not a valid asset")]
+    InvalidAssetInSmt { entry: Word, source: AssetError },
+    #[error("expected asset vault key to be {expected} but it was {actual}")]
+    AssetVaultKeyMismatch { expected: AssetVaultKey, actual: Word },
+    #[error("failed to add asset proof")]
+    FailedToAddProof(#[source] MerkleError),
+    #[error("asset is not tracked in the partial vault")]
+    UntrackedAsset(#[source] MerkleError),
 }
 
 // NOTE ERROR
@@ -378,6 +532,8 @@ pub enum AssetVaultError {
 
 #[derive(Debug, Error)]
 pub enum NoteError {
+    #[error("note tag length {0} exceeds the maximum of {max}", max = NoteTag::MAX_LOCAL_TAG_LENGTH)]
+    NoteTagLengthTooLarge(u8),
     #[error("duplicate fungible asset from issuer {0} in note")]
     DuplicateFungibleAsset(AccountId),
     #[error("duplicate non fungible asset {0} in note")]
@@ -423,6 +579,33 @@ pub enum NoteError {
     TooManyInputs(usize),
     #[error("note tag requires a public note but the note is of type {0}")]
     PublicNoteRequired(NoteType),
+    #[error("{error_msg}")]
+    Other {
+        error_msg: Box<str>,
+        // thiserror will return this when calling Error::source on NoteError.
+        source: Option<Box<dyn Error + Send + Sync + 'static>>,
+    },
+}
+
+impl NoteError {
+    /// Creates a custom error using the [`NoteError::Other`] variant from an error message.
+    pub fn other(message: impl Into<String>) -> Self {
+        let message: String = message.into();
+        Self::Other { error_msg: message.into(), source: None }
+    }
+
+    /// Creates a custom error using the [`NoteError::Other`] variant from an error message and
+    /// a source error.
+    pub fn other_with_source(
+        message: impl Into<String>,
+        source: impl Error + Send + Sync + 'static,
+    ) -> Self {
+        let message: String = message.into();
+        Self::Other {
+            error_msg: message.into(),
+            source: Some(Box::new(source)),
+        }
+    }
 }
 
 // PARTIAL BLOCKCHAIN ERROR
@@ -449,7 +632,7 @@ pub enum PartialBlockchainError {
     )]
     BlockHeaderCommitmentMismatch {
         block_num: BlockNumber,
-        block_commitment: Digest,
+        block_commitment: Word,
         source: MmrError,
     },
 }
@@ -482,16 +665,8 @@ pub enum TransactionScriptError {
 
 #[derive(Debug, Error)]
 pub enum TransactionInputError {
-    #[error("account seed must be provided for new accounts")]
-    AccountSeedNotProvidedForNewAccount,
-    #[error("account seed must not be provided for existing accounts")]
-    AccountSeedProvidedForExistingAccount,
     #[error("transaction input note with nullifier {0} is a duplicate")]
     DuplicateInputNote(Nullifier),
-    #[error(
-        "ID {expected} of the new account does not match the ID {actual} computed from the provided seed"
-    )]
-    InconsistentAccountSeed { expected: AccountId, actual: AccountId },
     #[error("partial blockchain has length {actual} which does not match block number {expected}")]
     InconsistentChainLength {
         expected: BlockNumber,
@@ -500,13 +675,11 @@ pub enum TransactionInputError {
     #[error(
         "partial blockchain has commitment {actual} which does not match the block header's chain commitment {expected}"
     )]
-    InconsistentChainCommitment { expected: Digest, actual: Digest },
+    InconsistentChainCommitment { expected: Word, actual: Word },
     #[error("block in which input note with id {0} was created is not in partial blockchain")]
     InputNoteBlockNotInPartialBlockchain(NoteId),
     #[error("input note with id {0} was not created in block {1}")]
     InputNoteNotInBlock(NoteId, BlockNumber),
-    #[error("account ID computed from seed is invalid")]
-    InvalidAccountIdSeed(#[source] AccountIdError),
     #[error(
         "total number of input notes is {0} which exceeds the maximum of {MAX_INPUT_NOTES_PER_TX}"
     )]
@@ -522,12 +695,14 @@ pub enum TransactionOutputError {
     DuplicateOutputNote(NoteId),
     #[error("final account commitment is not in the advice map")]
     FinalAccountCommitmentMissingInAdviceMap,
+    #[error("fee asset is not a fungible asset")]
+    FeeAssetNotFungibleAsset(#[source] AssetError),
     #[error("failed to parse final account header")]
     FinalAccountHeaderParseFailure(#[source] AccountError),
     #[error(
         "output notes commitment {expected} from kernel does not match computed commitment {actual}"
     )]
-    OutputNotesCommitmentInconsistent { expected: Digest, actual: Digest },
+    OutputNotesCommitmentInconsistent { expected: Word, actual: Word },
     #[error("transaction kernel output stack is invalid: {0}")]
     OutputStackInvalid(String),
     #[error(
@@ -547,8 +722,8 @@ pub enum ProvenTransactionError {
         "proven transaction's final account commitment {tx_final_commitment} and account details commitment {details_commitment} must match"
     )]
     AccountFinalCommitmentMismatch {
-        tx_final_commitment: Digest,
-        details_commitment: Digest,
+        tx_final_commitment: Word,
+        details_commitment: Word,
     },
     #[error(
         "proven transaction's final account ID {tx_account_id} and account details id {details_account_id} must match"
@@ -561,14 +736,14 @@ pub enum ProvenTransactionError {
     InputNotesError(TransactionInputError),
     #[error("private account {0} should not have account details")]
     PrivateAccountWithDetails(AccountId),
-    #[error("on-chain account {0} is missing its account details")]
-    OnChainAccountMissingDetails(AccountId),
-    #[error("new on-chain account {0} is missing its account details")]
-    NewOnChainAccountRequiresFullDetails(AccountId),
+    #[error("account {0} with public state is missing its account details")]
+    PublicStateAccountMissingDetails(AccountId),
+    #[error("new account {id} with public state must be accompanied by a full state delta")]
+    NewPublicStateAccountRequiresFullStateDelta { id: AccountId, source: AccountError },
     #[error(
-        "existing on-chain account {0} should only provide delta updates instead of full details"
+        "existing account {0} with public state should only provide delta updates instead of full details"
     )]
-    ExistingOnChainAccountRequiresDeltaDetails(AccountId),
+    ExistingPublicStateAccountRequiresDeltaDetails(AccountId),
     #[error("failed to construct output notes for proven transaction")]
     OutputNotesError(TransactionOutputError),
     #[error(
@@ -580,6 +755,8 @@ pub enum ProvenTransactionError {
     },
     #[error("proven transaction neither changed the account state, nor consumed any notes")]
     EmptyTransaction,
+    #[error("failed to validate account delta in transaction account update")]
+    AccountDeltaCommitmentMismatch(#[source] Box<dyn Error + Send + Sync + 'static>),
 }
 
 // PROPOSED BATCH ERROR
@@ -640,8 +817,8 @@ pub enum ProposedBatchError {
     )]
     NoteCommitmentMismatch {
         id: NoteId,
-        input_commitment: Digest,
-        output_commitment: Digest,
+        input_commitment: Word,
+        output_commitment: Word,
     },
 
     #[error("failed to merge transaction delta into account {account_id}")]
@@ -676,13 +853,13 @@ pub enum ProposedBatchError {
     #[error(
         "partial blockchain has root {actual} which does not match block header's root {expected}"
     )]
-    InconsistentChainRoot { expected: Digest, actual: Digest },
+    InconsistentChainRoot { expected: Word, actual: Word },
 
     #[error(
         "block {block_reference} referenced by transaction {transaction_id} is not in the partial blockchain"
     )]
     MissingTransactionBlockReference {
-        block_reference: Digest,
+        block_reference: Word,
         transaction_id: TransactionId,
     },
 }
@@ -760,7 +937,7 @@ pub enum ProposedBlockError {
     )]
     ConflictingBatchesUpdateSameAccount {
         account_id: AccountId,
-        initial_state_commitment: Digest,
+        initial_state_commitment: Word,
         first_batch_id: BatchId,
         second_batch_id: BatchId,
     },
@@ -777,8 +954,8 @@ pub enum ProposedBlockError {
         "partial blockchain has commitment {chain_commitment} which does not match the chain commitment {prev_block_chain_commitment} of the previous block {prev_block_num}"
     )]
     ChainRootNotEqualToPreviousBlockChainCommitment {
-        chain_commitment: Digest,
-        prev_block_chain_commitment: Digest,
+        chain_commitment: Word,
+        prev_block_chain_commitment: Word,
         prev_block_num: BlockNumber,
     },
 
@@ -795,8 +972,8 @@ pub enum ProposedBlockError {
     )]
     NoteCommitmentMismatch {
         id: NoteId,
-        input_commitment: Digest,
-        output_commitment: Digest,
+        input_commitment: Word,
+        output_commitment: Word,
     },
 
     #[error(
@@ -826,12 +1003,12 @@ pub enum ProposedBlockError {
 
     #[error(
         "account {account_id} with state {state_commitment} cannot transition to any of the remaining states {}",
-        remaining_state_commitments.iter().map(Digest::to_hex).collect::<Vec<_>>().join(", ")
+        remaining_state_commitments.iter().map(Word::to_hex).collect::<Vec<_>>().join(", ")
     )]
     InconsistentAccountStateTransition {
         account_id: AccountId,
-        state_commitment: Digest,
-        remaining_state_commitments: Vec<Digest>,
+        state_commitment: Word,
+        remaining_state_commitments: Vec<Word>,
     },
 
     #[error("no proof for nullifier {0} was provided")]
@@ -847,6 +1024,15 @@ pub enum ProposedBlockError {
     },
 }
 
+// FEE ERROR
+// ================================================================================================
+
+#[derive(Debug, Error)]
+pub enum FeeError {
+    #[error("native asset of the chain must be a fungible faucet but was of type {account_type}")]
+    NativeAssetIdNotFungible { account_type: AccountType },
+}
+
 // NULLIFIER TREE ERROR
 // ================================================================================================
 
@@ -860,6 +1046,9 @@ pub enum NullifierTreeError {
     #[error("attempt to mark nullifier {0} as spent but it is already spent")]
     NullifierAlreadySpent(Nullifier),
 
+    #[error("maximum number of nullifier tree leaves exceeded")]
+    MaxLeafEntriesExceeded(#[source] MerkleError),
+
     #[error("nullifier {nullifier} is not tracked by the partial nullifier tree")]
     UntrackedNullifier {
         nullifier: Nullifier,
@@ -868,4 +1057,16 @@ pub enum NullifierTreeError {
 
     #[error("new tree root after nullifier witness insertion does not match previous tree root")]
     TreeRootConflict(#[source] MerkleError),
+
+    #[error("failed to compute nulifier tree mutations")]
+    ComputeMutations(#[source] MerkleError),
+}
+
+// AUTH SCHEME ERROR
+// ================================================================================================
+
+#[derive(Debug, Error)]
+pub enum AuthSchemeError {
+    #[error("auth scheme identifier `{0}` is not valid")]
+    InvalidAuthSchemeIdentifier(u8),
 }

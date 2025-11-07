@@ -1,0 +1,138 @@
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+use miden_lib::transaction::EventId;
+use miden_objects::Word;
+use miden_objects::account::{AccountDelta, PartialAccount};
+use miden_objects::assembly::debuginfo::Location;
+use miden_objects::assembly::{SourceFile, SourceSpan};
+use miden_objects::transaction::{InputNote, InputNotes, OutputNote};
+use miden_processor::{
+    AdviceMutation,
+    BaseHost,
+    EventError,
+    MastForest,
+    MastForestStore,
+    ProcessState,
+    SyncHost,
+};
+
+use crate::AccountProcedureIndexMap;
+use crate::host::{
+    ScriptMastForestStore,
+    TransactionBaseHost,
+    TransactionEventData,
+    TransactionEventHandling,
+    TransactionProgress,
+};
+
+/// The transaction prover host is responsible for handling [`SyncHost`] requests made by the
+/// transaction kernel during proving.
+pub struct TransactionProverHost<'store, STORE>
+where
+    STORE: MastForestStore,
+{
+    /// The underlying base transaction host.
+    base_host: TransactionBaseHost<'store, STORE>,
+}
+
+impl<'store, STORE> TransactionProverHost<'store, STORE>
+where
+    STORE: MastForestStore,
+{
+    // CONSTRUCTORS
+    // --------------------------------------------------------------------------------------------
+
+    /// Creates a new [`TransactionProverHost`] instance from the provided inputs.
+    pub fn new(
+        account: &PartialAccount,
+        input_notes: InputNotes<InputNote>,
+        mast_store: &'store STORE,
+        scripts_mast_store: ScriptMastForestStore,
+        acct_procedure_index_map: AccountProcedureIndexMap,
+    ) -> Self {
+        let base_host = TransactionBaseHost::new(
+            account,
+            input_notes,
+            mast_store,
+            scripts_mast_store,
+            acct_procedure_index_map,
+        );
+
+        Self { base_host }
+    }
+
+    // PUBLIC ACCESSORS
+    // --------------------------------------------------------------------------------------------
+
+    /// Returns a reference to the `tx_progress` field of this transaction host.
+    pub fn tx_progress(&self) -> &TransactionProgress {
+        self.base_host.tx_progress()
+    }
+
+    /// Consumes `self` and returns the account delta, output notes and transaction progress.
+    pub fn into_parts(
+        self,
+    ) -> (AccountDelta, InputNotes<InputNote>, Vec<OutputNote>, TransactionProgress) {
+        self.base_host.into_parts()
+    }
+}
+
+// HOST IMPLEMENTATION
+// ================================================================================================
+
+impl<STORE> BaseHost for TransactionProverHost<'_, STORE>
+where
+    STORE: MastForestStore,
+{
+    fn get_label_and_source_file(
+        &self,
+        _location: &Location,
+    ) -> (SourceSpan, Option<Arc<SourceFile>>) {
+        // For the prover, we assume that the transaction witness is a successfully executed
+        // transaction and so there should be no need to provide the actual source manager, as it
+        // is only used to improve error message quality which we shouldn't run into here.
+        (SourceSpan::UNKNOWN, None)
+    }
+}
+
+impl<STORE> SyncHost for TransactionProverHost<'_, STORE>
+where
+    STORE: MastForestStore,
+{
+    fn get_mast_forest(&self, node_digest: &Word) -> Option<Arc<MastForest>> {
+        self.base_host.get_mast_forest(node_digest)
+    }
+
+    fn on_event(&mut self, process: &ProcessState) -> Result<Vec<AdviceMutation>, EventError> {
+        let event_id = EventId::from_felt(process.get_stack_item(0));
+
+        match self.base_host.handle_event(process, event_id)? {
+            TransactionEventHandling::Unhandled(event_data) => {
+                // We match on the event_data here so that if a new
+                // variant is added to the enum, this fails compilation and we can adapt
+                // accordingly.
+                match event_data {
+                    // The base host should have handled this event since the signature should be
+                    // present in the advice map.
+                    TransactionEventData::AuthRequest { .. } => {
+                        Err(EventError::from("base host should have handled auth request event"))
+                    },
+                    // Foreign account data and witnesses should be in the advice provider at
+                    // proving time, so there is nothing to do.
+                    TransactionEventData::ForeignAccount { .. } => Ok(Vec::new()),
+                    TransactionEventData::AccountVaultAssetWitness { .. } => Ok(Vec::new()),
+                    TransactionEventData::AccountStorageMapWitness { .. } => Ok(Vec::new()),
+                    // Note scripts should be in the advice provider at proving time, so there is
+                    // nothing to do.
+                    TransactionEventData::NoteData { .. } => Ok(Vec::new()),
+                    // We don't track enough information to handle this event. Since this just
+                    // improves error messages for users and the error should not be relevant during
+                    // proving, we ignore it.
+                    TransactionEventData::TransactionFeeComputed { .. } => Ok(Vec::new()),
+                }
+            },
+            TransactionEventHandling::Handled(mutations) => Ok(mutations),
+        }
+    }
+}

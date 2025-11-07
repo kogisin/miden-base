@@ -1,16 +1,25 @@
-use alloc::{string::ToString, vec::Vec};
+use alloc::string::ToString;
+use alloc::vec::Vec;
 
 use super::{
-    AccountError, AccountStorageDelta, ByteReader, ByteWriter, Deserializable,
-    DeserializationError, Digest, Felt, Hasher, Serializable, Word,
+    AccountError,
+    AccountStorageDelta,
+    ByteReader,
+    ByteWriter,
+    Deserializable,
+    DeserializationError,
+    Felt,
+    Hasher,
+    Serializable,
+    Word,
 };
 use crate::account::{AccountComponent, AccountType};
 
 mod slot;
-pub use slot::{StorageSlot, StorageSlotType};
+pub use slot::{SlotName, StorageSlot, StorageSlotType};
 
 mod map;
-pub use map::StorageMap;
+pub use map::{PartialStorageMap, StorageMap, StorageMapWitness};
 
 mod header;
 pub use header::{AccountStorageHeader, StorageSlotHeader};
@@ -30,7 +39,7 @@ pub use partial::PartialStorage;
 /// - [StorageSlot::Map]: contains a [StorageMap] which is a key-value map where both keys and
 ///   values are [Word]s. The value of a storage slot containing a map is the commitment to the
 ///   underlying map.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AccountStorage {
     slots: Vec<StorageSlot>,
 }
@@ -91,7 +100,7 @@ impl AccountStorage {
     // --------------------------------------------------------------------------------------------
 
     /// Returns a commitment to this storage.
-    pub fn commitment(&self) -> Digest {
+    pub fn commitment(&self) -> Word {
         build_slots_commitment(&self.slots)
     }
 
@@ -103,8 +112,13 @@ impl AccountStorage {
     }
 
     /// Returns a reference to the storage slots.
-    pub fn slots(&self) -> &Vec<StorageSlot> {
+    pub fn slots(&self) -> &[StorageSlot] {
         &self.slots
+    }
+
+    /// Consumes self and returns the storage slots of the account storage.
+    pub fn into_slots(self) -> Vec<StorageSlot> {
+        self.slots
     }
 
     /// Returns an [AccountStorageHeader] for this account storage.
@@ -118,14 +132,14 @@ impl AccountStorage {
     ///
     /// # Errors:
     /// - If the index is out of bounds
-    pub fn get_item(&self, index: u8) -> Result<Digest, AccountError> {
+    pub fn get_item(&self, index: u8) -> Result<Word, AccountError> {
         self.slots
             .get(index as usize)
             .ok_or(AccountError::StorageIndexOutOfBounds {
                 slots_len: self.slots.len() as u8,
                 index,
             })
-            .map(|slot| slot.value().into())
+            .map(|slot| slot.value())
     }
 
     /// Returns a map item from a map located in storage at the specified index.
@@ -138,7 +152,7 @@ impl AccountStorage {
             slots_len: self.slots.len() as u8,
             index,
         })? {
-            StorageSlot::Map(map) => Ok(map.get(&Digest::from(key))),
+            StorageSlot::Map(map) => Ok(map.get(&key)),
             _ => Err(AccountError::StorageSlotNotMap(index)),
         }
     }
@@ -176,7 +190,7 @@ impl AccountStorage {
                 _ => return Err(AccountError::StorageSlotNotMap(idx)),
             };
 
-            storage_map.apply_delta(map);
+            storage_map.apply_delta(map)?;
         }
 
         // update storage values
@@ -251,9 +265,9 @@ impl AccountStorage {
         let old_root = storage_map.root();
 
         // update the key-value pair in the map
-        let old_value = storage_map.insert(key.into(), value);
+        let old_value = storage_map.insert(key, value)?;
 
-        Ok((old_root.into(), old_value))
+        Ok((old_root, old_value))
     }
 }
 
@@ -281,7 +295,7 @@ fn slots_as_elements(slots: &[StorageSlot]) -> Vec<Felt> {
 }
 
 /// Computes the commitment to the given slots
-pub fn build_slots_commitment(slots: &[StorageSlot]) -> Digest {
+pub fn build_slots_commitment(slots: &[StorageSlot]) -> Word {
     let elements = slots_as_elements(slots);
     Hasher::hash_elements(&elements)
 }
@@ -323,7 +337,12 @@ impl Deserializable for AccountStorage {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccountStorage, Deserializable, Serializable, StorageMap, Word, build_slots_commitment,
+        AccountStorage,
+        Deserializable,
+        Serializable,
+        StorageMap,
+        Word,
+        build_slots_commitment,
     };
     use crate::account::StorageSlot;
 
@@ -336,7 +355,7 @@ mod tests {
 
         // storage with values for default types
         let storage = AccountStorage::new(vec![
-            StorageSlot::Value(Word::default()),
+            StorageSlot::Value(Word::empty()),
             StorageSlot::Map(StorageMap::default()),
         ])
         .unwrap();

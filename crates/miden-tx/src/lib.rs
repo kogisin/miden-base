@@ -6,26 +6,41 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
-pub use miden_objects::transaction::TransactionInputs;
-
 mod executor;
 pub use executor::{
-    DataStore, ExecutionOptions, MastForestStore, NoteAccountExecution, NoteConsumptionChecker,
-    NoteInputsCheck, TransactionExecutor,
+    DataStore,
+    ExecutionOptions,
+    FailedNote,
+    MAX_NUM_CHECKER_NOTES,
+    MastForestStore,
+    NoteConsumptionChecker,
+    NoteConsumptionInfo,
+    TransactionExecutor,
+    TransactionExecutorHost,
 };
 
-pub mod host;
-pub use host::{TransactionHost, TransactionProgress};
+mod host;
+pub use host::{AccountProcedureIndexMap, LinkMap, MemoryViewer, ScriptMastForestStore};
 
 mod prover;
-pub use prover::{LocalTransactionProver, ProvingOptions, TransactionMastStore, TransactionProver};
+pub use prover::{
+    LocalTransactionProver,
+    ProvingOptions,
+    TransactionMastStore,
+    TransactionProverHost,
+};
 
 mod verifier;
 pub use verifier::TransactionVerifier;
 
 mod errors;
 pub use errors::{
-    AuthenticationError, DataStoreError, TransactionExecutorError, TransactionProverError,
+    AuthenticationError,
+    DataStoreError,
+    NoteCheckerError,
+    TransactionExecutorError,
+    TransactionKernelError,
+    TransactionProverError,
     TransactionVerifierError,
 };
 

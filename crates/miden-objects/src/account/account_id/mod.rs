@@ -6,12 +6,6 @@ pub use id_prefix::AccountIdPrefix;
 
 mod seed;
 
-mod network_id;
-pub use network_id::NetworkId;
-
-mod address_type;
-pub use address_type::AddressType;
-
 mod account_type;
 pub use account_type::AccountType;
 
@@ -22,15 +16,16 @@ mod id_version;
 use alloc::string::{String, ToString};
 use core::fmt;
 
+use bech32::primitives::decode::ByteIter;
 pub use id_version::AccountIdVersion;
+use miden_core::Felt;
+use miden_core::utils::{ByteReader, Deserializable, Serializable};
 use miden_crypto::utils::hex_to_bytes;
-use vm_core::{
-    Felt, Word,
-    utils::{ByteReader, Deserializable, Serializable},
-};
-use vm_processor::{DeserializationError, Digest};
+use miden_processor::DeserializationError;
 
-use crate::{AccountError, errors::AccountIdError};
+use crate::address::NetworkId;
+use crate::errors::AccountIdError;
+use crate::{AccountError, Word};
 
 /// The identifier of an [`Account`](crate::account::Account).
 ///
@@ -120,8 +115,8 @@ impl AccountId {
     pub fn new(
         seed: Word,
         version: AccountIdVersion,
-        code_commitment: Digest,
-        storage_commitment: Digest,
+        code_commitment: Word,
+        storage_commitment: Word,
     ) -> Result<Self, AccountIdError> {
         match version {
             AccountIdVersion::Version0 => {
@@ -193,8 +188,8 @@ impl AccountId {
         account_type: AccountType,
         storage_mode: AccountStorageMode,
         version: AccountIdVersion,
-        code_commitment: Digest,
-        storage_commitment: Digest,
+        code_commitment: Word,
+        storage_commitment: Word,
     ) -> Result<Word, AccountError> {
         match version {
             AccountIdVersion::Version0 => AccountIdV0::compute_account_seed(
@@ -235,10 +230,10 @@ impl AccountId {
         }
     }
 
-    /// Returns `true` if the full state of the account is on chain, i.e. if the modes are
+    /// Returns `true` if the full state of the account is public on chain, i.e. if the modes are
     /// [`AccountStorageMode::Public`] or [`AccountStorageMode::Network`], `false` otherwise.
-    pub fn is_onchain(&self) -> bool {
-        self.storage_mode().is_onchain()
+    pub fn has_public_state(&self) -> bool {
+        self.storage_mode().has_public_state()
     }
 
     /// Returns `true` if the storage mode is [`AccountStorageMode::Public`], `false` otherwise.
@@ -279,13 +274,14 @@ impl AccountId {
         }
     }
 
-    /// Encodes the [`AccountId`] into a [bech32](https://github.com/bitcoin/bips/blob/master/bip-0173.mediawiki) string.
+    /// Encodes the [`AccountId`] into a [bech32](https://github.com/bitcoin/bips/blob/master/bip-0173.mediawiki)
+    /// string.
     ///
     /// # Encoding
     ///
     /// The encoding of an account ID into bech32 is done as follows:
     /// - Convert the account ID into its `[u8; 15]` data format.
-    /// - Insert the address type [`AddressType::AccountId`] byte at index 0, shifting all other
+    /// - Insert the address type `AddressType::AccountId` byte at index 0, shifting all other
     ///   elements to the right.
     /// - Choose an HRP, defined as a [`NetworkId`], for example [`NetworkId::Mainnet`] whose string
     ///   representation is `mm`.
@@ -295,8 +291,8 @@ impl AccountId {
     /// This is an example of an account ID in hex and bech32 representations:
     ///
     /// ```text
-    /// hex:    0x140fa04a1e61fc100000126ef8f1d6
-    /// bech32: mm1qq2qlgz2reslcyqqqqfxa7836chrjcvk
+    /// hex:    0x6d449e4034fadca075d1976fef7e38
+    /// bech32: mm1apk5f8jqxnadegr46xtklmm78qhdgkwc
     /// ```
     ///
     /// ## Rationale
@@ -306,11 +302,6 @@ impl AccountId {
     /// address type as a multiple of 8 means the first character of the bech32 string after the
     /// `1` separator will be different for every address type. This makes the type of the address
     /// conveniently human-readable.
-    ///
-    /// The only allowed checksum algorithm is [`Bech32m`](bech32::Bech32m) due to being the best
-    /// available checksum algorithm with no known weaknesses (unlike [`Bech32`](bech32::Bech32)).
-    /// No checksum is also not allowed since the intended use of bech32 is to have error
-    /// detection capabilities.
     pub fn to_bech32(&self, network_id: NetworkId) -> String {
         match self {
             AccountId::V0(account_id_v0) => account_id_v0.to_bech32(network_id),
@@ -324,6 +315,11 @@ impl AccountId {
     pub fn from_bech32(bech32_string: &str) -> Result<(NetworkId, Self), AccountIdError> {
         AccountIdV0::from_bech32(bech32_string)
             .map(|(network_id, account_id)| (network_id, AccountId::V0(account_id)))
+    }
+
+    /// Decodes the data from the bech32 byte iterator into an [`AccountId`].
+    pub(crate) fn from_bech32_byte_iter(byte_iter: ByteIter<'_>) -> Result<Self, AccountIdError> {
+        AccountIdV0::from_bech32_byte_iter(byte_iter).map(AccountId::V0)
     }
 
     /// Returns the [`AccountIdPrefix`] of this ID.
@@ -462,7 +458,7 @@ impl fmt::Display for AccountId {
 // ================================================================================================
 
 impl Serializable for AccountId {
-    fn write_into<W: miden_crypto::utils::ByteWriter>(&self, target: &mut W) {
+    fn write_into<W: miden_core::utils::ByteWriter>(&self, target: &mut W) {
         match self {
             AccountId::V0(account_id) => {
                 account_id.write_into(target);
@@ -490,22 +486,23 @@ impl Deserializable for AccountId {
 
 #[cfg(test)]
 mod tests {
+    use alloc::boxed::Box;
+
     use assert_matches::assert_matches;
-    use bech32::{Bech32, Bech32m, Hrp, NoChecksum};
+    use bech32::{Bech32, Bech32m, NoChecksum};
 
     use super::*;
-    use crate::{
-        account::account_id::{
-            address_type::AddressType,
-            v0::{extract_storage_mode, extract_type, extract_version},
-        },
-        errors::Bech32Error,
-        testing::account_id::{
-            ACCOUNT_ID_NETWORK_NON_FUNGIBLE_FAUCET, ACCOUNT_ID_PRIVATE_NON_FUNGIBLE_FAUCET,
-            ACCOUNT_ID_PRIVATE_SENDER, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET,
-            ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE,
-            ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
-        },
+    use crate::account::account_id::v0::{extract_storage_mode, extract_type, extract_version};
+    use crate::address::{AddressType, CustomNetworkId};
+    use crate::errors::Bech32Error;
+    use crate::testing::account_id::{
+        ACCOUNT_ID_NETWORK_NON_FUNGIBLE_FAUCET,
+        ACCOUNT_ID_PRIVATE_NON_FUNGIBLE_FAUCET,
+        ACCOUNT_ID_PRIVATE_SENDER,
+        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET,
+        ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE,
+        ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
+        AccountIdBuilder,
     };
 
     #[test]
@@ -531,36 +528,38 @@ mod tests {
     }
 
     #[test]
-    fn bech32_encode_decode_roundtrip() {
+    fn bech32_encode_decode_roundtrip() -> anyhow::Result<()> {
         // We use this to check that encoding does not panic even when using the longest possible
         // HRP.
         let longest_possible_hrp =
             "01234567890123456789012345678901234567890123456789012345678901234567890123456789012";
         assert_eq!(longest_possible_hrp.len(), 83);
 
+        let random_id = AccountIdBuilder::new().build_with_rng(&mut rand::rng());
+
         for network_id in [
             NetworkId::Mainnet,
-            NetworkId::Custom(Hrp::parse("custom").unwrap()),
-            NetworkId::Custom(Hrp::parse(longest_possible_hrp).unwrap()),
+            NetworkId::Custom(Box::new("custom".parse::<CustomNetworkId>()?)),
+            NetworkId::Custom(Box::new(longest_possible_hrp.parse::<CustomNetworkId>()?)),
         ] {
-            for (idx, account_id) in [
+            for account_id in [
                 ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
                 ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE,
                 ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET,
                 ACCOUNT_ID_PRIVATE_NON_FUNGIBLE_FAUCET,
                 ACCOUNT_ID_PRIVATE_SENDER,
+                random_id.into(),
             ]
             .into_iter()
-            .enumerate()
             {
                 let account_id = AccountId::try_from(account_id).unwrap();
 
-                let bech32_string = account_id.to_bech32(network_id);
+                let bech32_string = account_id.to_bech32(network_id.clone());
                 let (decoded_network_id, decoded_account_id) =
                     AccountId::from_bech32(&bech32_string).unwrap();
 
-                assert_eq!(network_id, decoded_network_id, "network id failed in {idx}");
-                assert_eq!(account_id, decoded_account_id, "account id failed in {idx}");
+                assert_eq!(network_id, decoded_network_id, "network id failed for {account_id}",);
+                assert_eq!(account_id, decoded_account_id, "account id failed for {account_id}");
 
                 let (_, data) = bech32::decode(&bech32_string).unwrap();
 
@@ -576,6 +575,8 @@ mod tests {
                 );
             }
         }
+
+        Ok(())
     }
 
     #[test]

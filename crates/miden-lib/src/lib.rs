@@ -8,10 +8,10 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
-use miden_objects::{
-    assembly::{Library, mast::MastForest},
-    utils::{serde::Deserializable, sync::LazyLock},
-};
+use miden_objects::assembly::Library;
+use miden_objects::assembly::mast::MastForest;
+use miden_objects::utils::serde::Deserializable;
+use miden_objects::utils::sync::LazyLock;
 
 mod auth;
 pub use auth::AuthScheme;
@@ -21,6 +21,9 @@ pub mod errors;
 pub mod note;
 pub mod transaction;
 pub mod utils;
+
+#[cfg(any(feature = "testing", test))]
+pub mod testing;
 
 // RE-EXPORTS
 // ================================================================================================
@@ -79,7 +82,7 @@ mod tests {
 
     #[test]
     fn test_compile() {
-        let path = "miden::account::get_id".parse::<LibraryPath>().unwrap();
+        let path = "miden::active_account::get_id".parse::<LibraryPath>().unwrap();
         let miden = MidenLib::default();
         let exists = miden.0.module_infos().any(|module| {
             module

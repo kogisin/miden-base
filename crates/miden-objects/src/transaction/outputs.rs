@@ -1,16 +1,29 @@
-use alloc::{collections::BTreeSet, string::ToString, vec::Vec};
+use alloc::collections::BTreeSet;
+use alloc::string::ToString;
+use alloc::vec::Vec;
 use core::fmt::Debug;
 
-use crate::{
-    Digest, Felt, Hasher, MAX_OUTPUT_NOTES_PER_TX, TransactionOutputError, Word,
-    account::AccountHeader,
-    block::BlockNumber,
-    note::{
-        Note, NoteAssets, NoteHeader, NoteId, NoteMetadata, NoteRecipient, PartialNote,
-        compute_note_commitment,
-    },
-    utils::serde::{ByteReader, ByteWriter, Deserializable, DeserializationError, Serializable},
+use crate::account::AccountHeader;
+use crate::asset::FungibleAsset;
+use crate::block::BlockNumber;
+use crate::note::{
+    Note,
+    NoteAssets,
+    NoteHeader,
+    NoteId,
+    NoteMetadata,
+    NoteRecipient,
+    PartialNote,
+    compute_note_commitment,
 };
+use crate::utils::serde::{
+    ByteReader,
+    ByteWriter,
+    Deserializable,
+    DeserializationError,
+    Serializable,
+};
+use crate::{Felt, Hasher, MAX_OUTPUT_NOTES_PER_TX, TransactionOutputError, Word};
 
 // TRANSACTION OUTPUTS
 // ================================================================================================
@@ -21,9 +34,11 @@ pub struct TransactionOutputs {
     /// Information related to the account's final state.
     pub account: AccountHeader,
     /// The commitment to the delta computed by the transaction kernel.
-    pub account_delta_commitment: Digest,
+    pub account_delta_commitment: Word,
     /// Set of output notes created by the transaction.
     pub output_notes: OutputNotes,
+    /// The fee of the transaction.
+    pub fee: FungibleAsset,
     /// Defines up to which block the transaction is considered valid.
     pub expiration_block_num: BlockNumber,
 }
@@ -33,6 +48,7 @@ impl Serializable for TransactionOutputs {
         self.account.write_into(target);
         self.account_delta_commitment.write_into(target);
         self.output_notes.write_into(target);
+        self.fee.write_into(target);
         self.expiration_block_num.write_into(target);
     }
 }
@@ -40,14 +56,16 @@ impl Serializable for TransactionOutputs {
 impl Deserializable for TransactionOutputs {
     fn read_from<R: ByteReader>(source: &mut R) -> Result<Self, DeserializationError> {
         let account = AccountHeader::read_from(source)?;
-        let account_delta_commitment = Digest::read_from(source)?;
+        let account_delta_commitment = Word::read_from(source)?;
         let output_notes = OutputNotes::read_from(source)?;
+        let fee = FungibleAsset::read_from(source)?;
         let expiration_block_num = BlockNumber::read_from(source)?;
 
         Ok(Self {
             account,
             account_delta_commitment,
             output_notes,
+            fee,
             expiration_block_num,
         })
     }
@@ -61,7 +79,7 @@ impl Deserializable for TransactionOutputs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputNotes {
     notes: Vec<OutputNote>,
-    commitment: Digest,
+    commitment: Word,
 }
 
 impl OutputNotes {
@@ -85,7 +103,7 @@ impl OutputNotes {
             }
         }
 
-        let commitment = build_output_notes_commitment(&notes);
+        let commitment = Self::compute_commitment(notes.iter().map(NoteHeader::from));
 
         Ok(Self { notes, commitment })
     }
@@ -97,7 +115,7 @@ impl OutputNotes {
     ///
     /// The commitment is computed as a sequential hash of (hash, metadata) tuples for the notes
     /// created in a transaction.
-    pub fn commitment(&self) -> Digest {
+    pub fn commitment(&self) -> Word {
         self.commitment
     }
     /// Returns total number of output notes.
@@ -121,6 +139,27 @@ impl OutputNotes {
     /// Returns an iterator over notes in this [OutputNotes].
     pub fn iter(&self) -> impl Iterator<Item = &OutputNote> {
         self.notes.iter()
+    }
+
+    // HELPERS
+    // --------------------------------------------------------------------------------------------
+
+    /// Computes a commitment to output notes.
+    ///
+    /// For a non-empty list of notes, this is a sequential hash of (note_id, metadata) tuples for
+    /// the notes created in a transaction. For an empty list, [EMPTY_WORD] is returned.
+    pub(crate) fn compute_commitment(notes: impl ExactSizeIterator<Item = NoteHeader>) -> Word {
+        if notes.len() == 0 {
+            return Word::empty();
+        }
+
+        let mut elements: Vec<Felt> = Vec::with_capacity(notes.len() * 8);
+        for note_header in notes {
+            elements.extend_from_slice(note_header.id().as_elements());
+            elements.extend_from_slice(Word::from(note_header.metadata()).as_elements());
+        }
+
+        Hasher::hash_elements(&elements)
     }
 }
 
@@ -180,8 +219,8 @@ impl OutputNote {
         }
     }
 
-    /// Returns the recipient of the precessed [`Full`](OutputNote::Full) output note. Returns
-    /// [`None`] if the note type is not [`Full`](OutputNote::Full).
+    /// Returns the recipient of the processed [`Full`](OutputNote::Full) output note, [`None`] if
+    /// the note type is not [`Full`](OutputNote::Full).
     ///
     /// See [crate::note::NoteRecipient] for more details.
     pub fn recipient(&self) -> Option<&NoteRecipient> {
@@ -197,7 +236,7 @@ impl OutputNote {
     /// [`Header`](OutputNote::Header).
     ///
     /// See [crate::note::NoteRecipient] for more details.
-    pub fn recipient_digest(&self) -> Option<Digest> {
+    pub fn recipient_digest(&self) -> Option<Word> {
         match self {
             OutputNote::Full(note) => Some(note.recipient().digest()),
             OutputNote::Partial(note) => Some(note.recipient_digest()),
@@ -232,7 +271,7 @@ impl OutputNote {
     /// Returns a commitment to the note and its metadata.
     ///
     /// > hash(NOTE_ID || NOTE_METADATA)
-    pub fn commitment(&self) -> Digest {
+    pub fn commitment(&self) -> Word {
         compute_note_commitment(self.id(), self.metadata())
     }
 }
@@ -289,51 +328,21 @@ impl Deserializable for OutputNote {
     }
 }
 
-// HELPER FUNCTIONS
-// ================================================================================================
-
-/// Build a commitment to output notes.
-///
-/// For a non-empty list of notes, this is a sequential hash of (note_id, metadata) tuples for the
-/// notes created in a transaction. For an empty list, [EMPTY_WORD] is returned.
-fn build_output_notes_commitment(notes: &[OutputNote]) -> Digest {
-    if notes.is_empty() {
-        return Digest::default();
-    }
-
-    let mut elements: Vec<Felt> = Vec::with_capacity(notes.len() * 8);
-    for note in notes.iter() {
-        elements.extend_from_slice(note.id().as_elements());
-        elements.extend_from_slice(&Word::from(note.metadata()));
-    }
-
-    Hasher::hash_elements(&elements)
-}
-
 // TESTS
 // ================================================================================================
 
 #[cfg(test)]
 mod output_notes_tests {
-    use anyhow::Context;
-    use assembly::Assembler;
     use assert_matches::assert_matches;
 
     use super::OutputNotes;
-    use crate::{
-        TransactionOutputError,
-        account::AccountId,
-        testing::{account_id::ACCOUNT_ID_SENDER, note::NoteBuilder},
-        transaction::OutputNote,
-    };
+    use crate::note::Note;
+    use crate::transaction::OutputNote;
+    use crate::{TransactionOutputError, Word};
 
     #[test]
     fn test_duplicate_output_notes() -> anyhow::Result<()> {
-        let mock_account_id: AccountId = ACCOUNT_ID_SENDER.try_into().unwrap();
-
-        let mock_note = NoteBuilder::new(mock_account_id, &mut rand::rng())
-            .build(&Assembler::default())
-            .context("failed to create mock note")?;
+        let mock_note = Note::mock_noop(Word::empty());
         let mock_note_id = mock_note.id();
         let mock_note_clone = mock_note.clone();
 

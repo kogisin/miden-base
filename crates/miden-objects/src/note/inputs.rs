@@ -1,10 +1,14 @@
 use alloc::vec::Vec;
 
-use crate::{
-    Digest, Felt, Hasher, MAX_INPUTS_PER_NOTE, WORD_SIZE, ZERO,
-    errors::NoteError,
-    utils::serde::{ByteReader, ByteWriter, Deserializable, DeserializationError, Serializable},
+use crate::errors::NoteError;
+use crate::utils::serde::{
+    ByteReader,
+    ByteWriter,
+    Deserializable,
+    DeserializationError,
+    Serializable,
 };
+use crate::{Felt, Hasher, MAX_INPUTS_PER_NOTE, WORD_SIZE, Word, ZERO};
 
 // NOTE INPUTS
 // ================================================================================================
@@ -20,7 +24,7 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct NoteInputs {
     values: Vec<Felt>,
-    commitment: Digest,
+    commitment: Word,
 }
 
 impl NoteInputs {
@@ -43,7 +47,7 @@ impl NoteInputs {
     // --------------------------------------------------------------------------------------------
 
     /// Returns a commitment to these inputs.
-    pub fn commitment(&self) -> Digest {
+    pub fn commitment(&self) -> Word {
         self.commitment
     }
 
@@ -64,14 +68,13 @@ impl NoteInputs {
         &self.values
     }
 
-    /// Returns the note's input formatted to be used with the advice map.
+    /// Returns the note's input as a vector of field elements.
     ///
     /// The format is `INPUTS || PADDING`, where:
     ///
-    /// Where:
     /// - INPUTS is the variable inputs for the note
     /// - PADDING is the optional padding to align the data with a 2WORD boundary
-    pub fn format_for_advice(&self) -> Vec<Felt> {
+    pub fn to_elements(&self) -> Vec<Felt> {
         pad_inputs(&self.values)
     }
 }

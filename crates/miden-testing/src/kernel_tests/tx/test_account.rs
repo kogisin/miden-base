@@ -1,81 +1,104 @@
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use std::collections::BTreeMap;
+
 use anyhow::Context;
-use miden_lib::{
-    errors::tx_kernel_errors::{
-        ERR_ACCOUNT_ID_SUFFIX_LEAST_SIGNIFICANT_BYTE_MUST_BE_ZERO,
-        ERR_ACCOUNT_ID_SUFFIX_MOST_SIGNIFICANT_BIT_MUST_BE_ZERO,
-        ERR_ACCOUNT_ID_UNKNOWN_STORAGE_MODE, ERR_ACCOUNT_ID_UNKNOWN_VERSION,
-        ERR_ACCOUNT_STORAGE_SLOT_INDEX_OUT_OF_BOUNDS, ERR_FAUCET_INVALID_STORAGE_OFFSET,
-    },
-    transaction::TransactionKernel,
-    utils::word_to_masm_push_string,
+use miden_lib::errors::tx_kernel_errors::{
+    ERR_ACCOUNT_ID_SUFFIX_LEAST_SIGNIFICANT_BYTE_MUST_BE_ZERO,
+    ERR_ACCOUNT_ID_SUFFIX_MOST_SIGNIFICANT_BIT_MUST_BE_ZERO,
+    ERR_ACCOUNT_ID_UNKNOWN_STORAGE_MODE,
+    ERR_ACCOUNT_ID_UNKNOWN_VERSION,
+    ERR_ACCOUNT_NONCE_AT_MAX,
+    ERR_ACCOUNT_NONCE_CAN_ONLY_BE_INCREMENTED_ONCE,
+    ERR_ACCOUNT_STORAGE_SLOT_INDEX_OUT_OF_BOUNDS,
+    ERR_FAUCET_INVALID_STORAGE_OFFSET,
 };
-use miden_objects::{
-    account::{
-        Account, AccountBuilder, AccountCode, AccountComponent, AccountId, AccountIdVersion,
-        AccountProcedureInfo, AccountStorage, AccountStorageMode, AccountType, StorageSlot,
-    },
-    assembly::{
-        Library,
-        diagnostics::{IntoDiagnostic, Report, WrapErr, miette},
-    },
-    asset::AssetVault,
-    testing::{
-        account_component::AccountMockComponent,
-        account_id::{
-            ACCOUNT_ID_PRIVATE_NON_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET,
-            ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE,
-            ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
-        },
-        storage::STORAGE_LEAVES_2,
-    },
-    transaction::{ExecutedTransaction, TransactionScript},
+use miden_lib::testing::account_component::MockAccountComponent;
+use miden_lib::testing::mock_account::MockAccountExt;
+use miden_lib::transaction::TransactionKernel;
+use miden_lib::utils::ScriptBuilder;
+use miden_objects::account::delta::AccountUpdateDetails;
+use miden_objects::account::{
+    Account,
+    AccountBuilder,
+    AccountCode,
+    AccountComponent,
+    AccountId,
+    AccountIdVersion,
+    AccountProcedureInfo,
+    AccountStorage,
+    AccountStorageMode,
+    AccountType,
+    StorageMap,
+    StorageSlot,
 };
-use miden_tx::TransactionExecutorError;
+use miden_objects::assembly::diagnostics::{IntoDiagnostic, NamedSource, Report, WrapErr, miette};
+use miden_objects::assembly::{DefaultSourceManager, Library};
+use miden_objects::asset::{Asset, AssetVault, FungibleAsset};
+use miden_objects::note::NoteType;
+use miden_objects::testing::account_id::{
+    ACCOUNT_ID_PRIVATE_NON_FUNGIBLE_FAUCET,
+    ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET,
+    ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
+    ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE,
+    ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
+    ACCOUNT_ID_SENDER,
+};
+use miden_objects::testing::storage::STORAGE_LEAVES_2;
+use miden_objects::transaction::{ExecutedTransaction, OutputNote, TransactionScript};
+use miden_objects::{LexicographicWord, StarkField};
+use miden_processor::{EMPTY_WORD, ExecutionError, MastNodeExt, Word};
+use miden_tx::{LocalTransactionProver, TransactionExecutorError};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
-use vm_processor::{Digest, EMPTY_WORD, ExecutionError, MemAdviceProvider, ProcessState};
+use winter_rand_utils::rand_value;
 
-use super::{Felt, ONE, StackInputs, Word, ZERO};
+use super::{Felt, StackInputs, ZERO};
+use crate::executor::CodeExecutor;
+use crate::kernel_tests::tx::ExecutionOutputExt;
+use crate::utils::create_public_p2any_note;
 use crate::{
-    Auth, MockChain, TransactionContextBuilder, assert_execution_error, executor::CodeExecutor,
+    Auth,
+    MockChain,
+    TransactionContextBuilder,
+    TxContextInput,
+    assert_execution_error,
+    assert_transaction_executor_error,
 };
 
 // ACCOUNT COMMITMENT TESTS
 // ================================================================================================
 
-#[test]
-pub fn compute_current_commitment() -> miette::Result<()> {
-    let account = Account::mock(
-        ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE,
-        ONE,
-        Auth::IncrNonce,
-        TransactionKernel::assembler(),
-    );
+#[tokio::test]
+pub async fn compute_commitment() -> miette::Result<()> {
+    let account = Account::mock(ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE, Auth::IncrNonce);
 
     // Precompute a commitment to a changed account so we can assert it during tx script execution.
     let mut account_clone = account.clone();
-    let key = Digest::from([1, 2, 3, 4u32]);
-    let value = Digest::from([2, 3, 4, 5u32]);
-    account_clone.storage_mut().set_map_item(2, *key, *value).unwrap();
+    let key = Word::from([1, 2, 3, 4u32]);
+    let value = Word::from([2, 3, 4, 5u32]);
+    account_clone.storage_mut().set_map_item(2, key, value).unwrap();
     let expected_commitment = account_clone.commitment();
 
     let tx_script = format!(
         r#"
+        use.std::word
+
         use.miden::prologue
-        use.miden::account
-        use.test::account->test_account
+        use.miden::active_account
+        use.mock::account->mock_account
 
         begin
-            exec.account::get_initial_commitment
+            exec.active_account::get_initial_commitment
             # => [INITIAL_COMMITMENT]
 
-            exec.account::compute_current_commitment
+            exec.active_account::compute_commitment
             # => [CURRENT_COMMITMENT, INITIAL_COMMITMENT]
 
             assert_eqw.err="initial and current commitment should be equal when no changes have been made"
             # => []
 
-            call.test_account::get_storage_commitment
+            call.mock_account::compute_storage_commitment
             # => [STORAGE_COMMITMENT0, pad(12)]
             swapdw dropw dropw swapw dropw
             # => [STORAGE_COMMITMENT0]
@@ -86,12 +109,12 @@ pub fn compute_current_commitment() -> miette::Result<()> {
             push.{key}
             push.2
             # => [slot_idx = 2, KEY, VALUE, pad(7)]
-            call.test_account::set_map_item
+            call.mock_account::set_map_item
             dropw dropw dropw dropw
             # => [STORAGE_COMMITMENT0]
 
             # compute the commitment which will recompute the storage commitment
-            exec.account::compute_current_commitment
+            exec.active_account::compute_commitment
             # => [CURRENT_COMMITMENT, STORAGE_COMMITMENT0]
 
             push.{expected_commitment}
@@ -99,59 +122,37 @@ pub fn compute_current_commitment() -> miette::Result<()> {
             # => [STORAGE_COMMITMENT0]
 
             padw padw padw padw
-            call.test_account::get_storage_commitment
+            call.mock_account::compute_storage_commitment
             # => [STORAGE_COMMITMENT1, pad(12), STORAGE_COMMITMENT0]
             swapdw dropw dropw swapw dropw
             # => [STORAGE_COMMITMENT1, STORAGE_COMMITMENT0]
 
-            eqw not assert.err="storage commitment should have been updated by compute_current_commitment"
-            # => [STORAGE_COMMITMENT1, STORAGE_COMMITMENT0]
-
-            dropw dropw dropw dropw
+            # assert that the commitment has changed
+            exec.word::eq
+            assertz.err="storage commitment should have been updated by compute_commitment"
+            # => []
         end
     "#,
-        key = word_to_masm_push_string(&key),
-        value = word_to_masm_push_string(&value),
-        expected_commitment = word_to_masm_push_string(&expected_commitment),
+        key = &key,
+        value = &value,
+        expected_commitment = &expected_commitment,
     );
 
     let tx_context_builder = TransactionContextBuilder::new(account);
-    let tx_script =
-        TransactionScript::compile(tx_script, tx_context_builder.assembler()).into_diagnostic()?;
+    let tx_script = ScriptBuilder::with_mock_libraries()
+        .into_diagnostic()?
+        .compile_tx_script(tx_script)
+        .into_diagnostic()?;
     let tx_context = tx_context_builder
         .tx_script(tx_script)
         .build()
         .map_err(|err| miette::miette!("{err}"))?;
 
-    tx_context.execute().into_diagnostic().wrap_err("failed to execute code")?;
-
-    Ok(())
-}
-
-// ACCOUNT CODE TESTS
-// ================================================================================================
-
-#[test]
-pub fn test_get_code() -> miette::Result<()> {
-    let tx_context = TransactionContextBuilder::with_existing_mock_account().build().unwrap();
-    let code = "
-        use.kernel::prologue
-        use.kernel::account
-        begin
-            exec.prologue::prepare_transaction
-            exec.account::get_code_commitment
-            swapw dropw
-        end
-        ";
-
-    let process = &tx_context.execute_code(code).unwrap();
-    let process_state: ProcessState = process.into();
-
-    assert_eq!(
-        process_state.get_stack_word(0),
-        tx_context.account().code().commitment().as_elements(),
-        "obtained code commitment is not equal to the account code commitment",
-    );
+    tx_context
+        .execute()
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to execute transaction")?;
 
     Ok(())
 }
@@ -159,8 +160,8 @@ pub fn test_get_code() -> miette::Result<()> {
 // ACCOUNT ID TESTS
 // ================================================================================================
 
-#[test]
-pub fn test_account_type() -> miette::Result<()> {
+#[tokio::test]
+async fn test_account_type() -> miette::Result<()> {
     let procedures = vec![
         ("is_fungible_faucet", AccountType::FungibleFaucet),
         ("is_non_fungible_faucet", AccountType::NonFungibleFaucet),
@@ -183,7 +184,7 @@ pub fn test_account_type() -> miette::Result<()> {
 
             let code = format!(
                 "
-                use.kernel::account_id
+                use.$kernel::account_id
 
                 begin
                     exec.account_id::{procedure}
@@ -191,18 +192,19 @@ pub fn test_account_type() -> miette::Result<()> {
                 "
             );
 
-            let process = CodeExecutor::with_advice_provider(MemAdviceProvider::default())
+            let exec_output = CodeExecutor::with_default_host()
                 .stack_inputs(
                     StackInputs::new(vec![account_id.prefix().as_felt()]).into_diagnostic()?,
                 )
-                .run(&code)?;
+                .run(&code)
+                .await?;
 
             let type_matches = account_id.account_type() == expected_type;
             let expected_result = Felt::from(type_matches);
             has_type |= type_matches;
 
             assert_eq!(
-                process.stack.get(0),
+                exec_output.get_stack_element(0),
                 expected_result,
                 "Rust and Masm check on account type diverge. proc: {} account_id: {} account_type: {:?} expected_type: {:?}",
                 procedure,
@@ -218,8 +220,8 @@ pub fn test_account_type() -> miette::Result<()> {
     Ok(())
 }
 
-#[test]
-pub fn test_account_validate_id() -> miette::Result<()> {
+#[tokio::test]
+async fn test_account_validate_id() -> miette::Result<()> {
     let test_cases = [
         (ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE, None),
         (ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE, None),
@@ -254,16 +256,17 @@ pub fn test_account_validate_id() -> miette::Result<()> {
         let suffix = Felt::try_from((account_id % (1u128 << 64)) as u64).unwrap();
 
         let code = "
-            use.kernel::account_id
+            use.$kernel::account_id
 
             begin
                 exec.account_id::validate
             end
             ";
 
-        let result = CodeExecutor::with_advice_provider(MemAdviceProvider::default())
+        let result = CodeExecutor::with_default_host()
             .stack_inputs(StackInputs::new(vec![suffix, prefix]).unwrap())
-            .run(code);
+            .run(code)
+            .await;
 
         match (result, expected_error) {
             (Ok(_), None) => (),
@@ -292,8 +295,8 @@ pub fn test_account_validate_id() -> miette::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_is_faucet_procedure() -> miette::Result<()> {
+#[tokio::test]
+async fn test_is_faucet_procedure() -> miette::Result<()> {
     let test_cases = [
         ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
         ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE,
@@ -306,7 +309,7 @@ fn test_is_faucet_procedure() -> miette::Result<()> {
 
         let code = format!(
             "
-            use.kernel::account_id
+            use.$kernel::account_id
 
             begin
                 push.{prefix}
@@ -320,13 +323,14 @@ fn test_is_faucet_procedure() -> miette::Result<()> {
             prefix = account_id.prefix().as_felt(),
         );
 
-        let process = CodeExecutor::with_advice_provider(MemAdviceProvider::default())
+        let exec_output = CodeExecutor::with_default_host()
             .run(&code)
+            .await
             .wrap_err("failed to execute is_faucet procedure")?;
 
         let is_faucet = account_id.is_faucet();
         assert_eq!(
-            process.stack.get(0),
+            exec_output.get_stack_element(0),
             Felt::new(is_faucet as u64),
             "Rust and MASM is_faucet diverged for account_id {account_id}"
         );
@@ -335,18 +339,48 @@ fn test_is_faucet_procedure() -> miette::Result<()> {
     Ok(())
 }
 
+// ACCOUNT CODE TESTS
+// ================================================================================================
+
+// TODO: update this test once the ability to change the account code will be implemented
+#[tokio::test]
+pub async fn test_compute_code_commitment() -> miette::Result<()> {
+    let tx_context = TransactionContextBuilder::with_existing_mock_account().build().unwrap();
+    let account = tx_context.account();
+
+    let code = format!(
+        r#"
+        use.$kernel::prologue
+        use.mock::account->mock_account
+
+        begin
+            exec.prologue::prepare_transaction
+            # get the code commitment
+            call.mock_account::get_code_commitment
+            push.{expected_code_commitment}
+            assert_eqw.err="actual code commitment is not equal to the expected one"
+        end
+        "#,
+        expected_code_commitment = account.code().commitment()
+    );
+
+    tx_context.execute_code(&code).await?;
+
+    Ok(())
+}
+
 // ACCOUNT STORAGE TESTS
 // ================================================================================================
 
-#[test]
-fn test_get_item() -> miette::Result<()> {
+#[tokio::test]
+async fn test_get_item() -> miette::Result<()> {
     for storage_item in [AccountStorage::mock_item_0(), AccountStorage::mock_item_1()] {
         let tx_context = TransactionContextBuilder::with_existing_mock_account().build().unwrap();
 
         let code = format!(
             "
-            use.kernel::account
-            use.kernel::prologue
+            use.$kernel::account
+            use.$kernel::prologue
 
             begin
                 exec.prologue::prepare_transaction
@@ -361,26 +395,20 @@ fn test_get_item() -> miette::Result<()> {
             end
             ",
             item_index = storage_item.index,
-            item_value = word_to_masm_push_string(&storage_item.slot.value())
+            item_value = &storage_item.slot.value(),
         );
 
-        tx_context.execute_code(&code).unwrap();
+        tx_context.execute_code(&code).await.unwrap();
     }
 
     Ok(())
 }
 
-#[test]
-fn test_get_map_item() -> miette::Result<()> {
+#[tokio::test]
+async fn test_get_map_item() -> miette::Result<()> {
     let account = AccountBuilder::new(ChaCha20Rng::from_os_rng().random())
         .with_auth_component(Auth::IncrNonce)
-        .with_component(
-            AccountMockComponent::new_with_slots(
-                TransactionKernel::assembler(),
-                vec![AccountStorage::mock_item_2().slot],
-            )
-            .unwrap(),
-        )
+        .with_component(MockAccountComponent::with_slots(vec![AccountStorage::mock_item_2().slot]))
         .build_existing()
         .unwrap();
 
@@ -389,7 +417,7 @@ fn test_get_map_item() -> miette::Result<()> {
     for (key, value) in STORAGE_LEAVES_2 {
         let code = format!(
             "
-            use.kernel::prologue
+            use.$kernel::prologue
 
             begin
                 exec.prologue::prepare_transaction
@@ -397,42 +425,35 @@ fn test_get_map_item() -> miette::Result<()> {
                 # get the map item
                 push.{map_key}
                 push.{item_index}
-                call.::test::account::get_map_item
+                call.::mock::account::get_map_item
 
-                # truncate the stack 
+                # truncate the stack
                 swapw dropw movup.4 drop
             end
             ",
             item_index = 0,
-            map_key = word_to_masm_push_string(&key),
+            map_key = &key,
         );
 
-        let process = &tx_context
-            .execute_code_with_assembler(
-                &code,
-                TransactionKernel::testing_assembler_with_mock_account(),
-            )
-            .unwrap();
-        let process_state: ProcessState = process.into();
-
+        let exec_output = &mut tx_context.execute_code(&code).await?;
         assert_eq!(
+            exec_output.get_stack_word_be(0),
             value,
-            process_state.get_stack_word(0),
             "get_map_item result doesn't match the expected value",
         );
         assert_eq!(
-            Word::default(),
-            process_state.get_stack_word(1),
+            exec_output.get_stack_word_be(4),
+            Word::empty(),
             "The rest of the stack must be cleared",
         );
         assert_eq!(
-            Word::default(),
-            process_state.get_stack_word(2),
+            exec_output.get_stack_word_be(8),
+            Word::empty(),
             "The rest of the stack must be cleared",
         );
         assert_eq!(
-            Word::default(),
-            process_state.get_stack_word(3),
+            exec_output.get_stack_word_be(12),
+            Word::empty(),
             "The rest of the stack must be cleared",
         );
     }
@@ -440,8 +461,8 @@ fn test_get_map_item() -> miette::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_get_storage_slot_type() -> miette::Result<()> {
+#[tokio::test]
+async fn test_get_storage_slot_type() -> miette::Result<()> {
     for storage_item in [
         AccountStorage::mock_item_0(),
         AccountStorage::mock_item_1(),
@@ -451,8 +472,8 @@ fn test_get_storage_slot_type() -> miette::Result<()> {
 
         let code = format!(
             "
-            use.kernel::account
-            use.kernel::prologue
+            use.$kernel::account
+            use.$kernel::prologue
 
             begin
                 exec.prologue::prepare_transaction
@@ -470,28 +491,27 @@ fn test_get_storage_slot_type() -> miette::Result<()> {
             item_index = storage_item.index,
         );
 
-        let process = &tx_context.execute_code(&code).unwrap();
-        let process_state: ProcessState = process.into();
+        let exec_output = &tx_context.execute_code(&code).await.unwrap();
 
         let storage_slot_type = storage_item.slot.slot_type();
 
-        assert_eq!(storage_slot_type, process_state.get_stack_item(0).try_into().unwrap());
-        assert_eq!(process_state.get_stack_item(1), ZERO, "the rest of the stack is empty");
-        assert_eq!(process_state.get_stack_item(2), ZERO, "the rest of the stack is empty");
-        assert_eq!(process_state.get_stack_item(3), ZERO, "the rest of the stack is empty");
+        assert_eq!(storage_slot_type, exec_output.get_stack_element(0).try_into().unwrap());
+        assert_eq!(exec_output.get_stack_element(1), ZERO, "the rest of the stack is empty");
+        assert_eq!(exec_output.get_stack_element(2), ZERO, "the rest of the stack is empty");
+        assert_eq!(exec_output.get_stack_element(3), ZERO, "the rest of the stack is empty");
         assert_eq!(
-            Word::default(),
-            process_state.get_stack_word(1),
+            exec_output.get_stack_word_be(4),
+            Word::empty(),
             "the rest of the stack is empty"
         );
         assert_eq!(
-            Word::default(),
-            process_state.get_stack_word(2),
+            exec_output.get_stack_word_be(8),
+            Word::empty(),
             "the rest of the stack is empty"
         );
         assert_eq!(
-            Word::default(),
-            process_state.get_stack_word(3),
+            exec_output.get_stack_word_be(12),
+            Word::empty(),
             "the rest of the stack is empty"
         );
     }
@@ -499,16 +519,16 @@ fn test_get_storage_slot_type() -> miette::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_set_item() -> miette::Result<()> {
+#[tokio::test]
+async fn test_set_item() -> miette::Result<()> {
     let tx_context = TransactionContextBuilder::with_existing_mock_account().build().unwrap();
 
-    let new_storage_item: Word = [Felt::new(91), Felt::new(92), Felt::new(93), Felt::new(94)];
+    let new_storage_item = Word::from([91, 92, 93, 94u32]);
 
     let code = format!(
         "
-        use.kernel::account
-        use.kernel::prologue
+        use.$kernel::account
+        use.$kernel::prologue
 
         begin
             exec.prologue::prepare_transaction
@@ -528,31 +548,23 @@ fn test_set_item() -> miette::Result<()> {
             assert_eqw
         end
         ",
-        new_storage_item = word_to_masm_push_string(&new_storage_item),
+        new_storage_item = &new_storage_item,
         new_storage_item_index = 0,
     );
 
-    tx_context.execute_code(&code).unwrap();
+    tx_context.execute_code(&code).await.unwrap();
 
     Ok(())
 }
 
-#[test]
-fn test_set_map_item() -> miette::Result<()> {
-    let (new_key, new_value) = (
-        Digest::new([Felt::new(109), Felt::new(110), Felt::new(111), Felt::new(112)]),
-        [Felt::new(9_u64), Felt::new(10_u64), Felt::new(11_u64), Felt::new(12_u64)],
-    );
+#[tokio::test]
+async fn test_set_map_item() -> miette::Result<()> {
+    let (new_key, new_value) =
+        (Word::from([109, 110, 111, 112u32]), Word::from([9, 10, 11, 12u32]));
 
     let account = AccountBuilder::new(ChaCha20Rng::from_os_rng().random())
         .with_auth_component(Auth::IncrNonce)
-        .with_component(
-            AccountMockComponent::new_with_slots(
-                TransactionKernel::assembler(),
-                vec![AccountStorage::mock_item_2().slot],
-            )
-            .unwrap(),
-        )
+        .with_component(MockAccountComponent::with_slots(vec![AccountStorage::mock_item_2().slot]))
         .build_existing()
         .unwrap();
 
@@ -563,8 +575,8 @@ fn test_set_map_item() -> miette::Result<()> {
         "
         use.std::sys
 
-        use.test::account
-        use.kernel::prologue
+        use.$kernel::prologue
+        use.mock::account->mock_account
 
         begin
             exec.prologue::prepare_transaction
@@ -573,50 +585,45 @@ fn test_set_map_item() -> miette::Result<()> {
             push.{new_value}
             push.{new_key}
             push.{item_index}
-            call.account::set_map_item
+            call.mock_account::set_map_item
 
             # double check that on storage slot is indeed the new map
             push.{item_index}
-            call.account::get_item
+            call.mock_account::get_item
 
             # truncate the stack
             exec.sys::truncate_stack
         end
         ",
         item_index = 0,
-        new_key = word_to_masm_push_string(&new_key),
-        new_value = word_to_masm_push_string(&new_value),
+        new_key = &new_key,
+        new_value = &new_value,
     );
 
-    let process = &tx_context
-        .execute_code_with_assembler(
-            &code,
-            TransactionKernel::testing_assembler_with_mock_account(),
-        )
-        .unwrap();
-    let process_state: ProcessState = process.into();
+    let exec_output = &tx_context.execute_code(&code).await.unwrap();
 
     let mut new_storage_map = AccountStorage::mock_map();
-    new_storage_map.insert(new_key, new_value);
+    new_storage_map.insert(new_key, new_value).unwrap();
 
     assert_eq!(
         new_storage_map.root(),
-        Digest::from(process_state.get_stack_word(0)),
+        exec_output.get_stack_word_be(0),
         "get_item must return the new updated value",
     );
     assert_eq!(
         storage_item.slot.value(),
-        process_state.get_stack_word(1),
+        exec_output.get_stack_word_be(4),
         "The original value stored in the map doesn't match the expected value",
     );
 
     Ok(())
 }
 
-#[test]
-fn test_account_component_storage_offset() -> miette::Result<()> {
+#[tokio::test]
+async fn test_account_component_storage_offset() -> miette::Result<()> {
     // setup assembler
-    let assembler = TransactionKernel::testing_assembler();
+    let assembler =
+        TransactionKernel::with_kernel_library(Arc::new(DefaultSourceManager::default()));
 
     // The following code will execute the following logic that will be asserted during the test:
     //
@@ -628,40 +635,44 @@ fn test_account_component_storage_offset() -> miette::Result<()> {
     // We will then assert that we are able to retrieve the correct elements from storage
     // insuring consistent "set" and "get" using offsets.
     let source_code_component1 = "
-        use.miden::account
+        use.std::word
+        use.miden::active_account
+        use.miden::native_account
 
         export.foo_write
             push.1.2.3.4.0
-            exec.account::set_item
+            exec.native_account::set_item
 
             dropw
         end
 
         export.foo_read
             push.0
-            exec.account::get_item
-            push.1.2.3.4 eqw assert
+            exec.active_account::get_item
+            push.1.2.3.4
 
-            dropw dropw
+            exec.word::eq assert
         end
     ";
 
     let source_code_component2 = "
-        use.miden::account
+        use.std::word
+        use.miden::active_account
+        use.miden::native_account
 
         export.bar_write
             push.5.6.7.8.0
-            exec.account::set_item
+            exec.native_account::set_item
 
             dropw
         end
 
         export.bar_read
             push.0
-            exec.account::get_item
-            push.5.6.7.8 eqw assert
+            exec.active_account::get_item
+            push.5.6.7.8
 
-            dropw dropw
+            exec.word::eq assert
         end
     ";
 
@@ -670,8 +681,8 @@ fn test_account_component_storage_offset() -> miette::Result<()> {
     let code2 = assembler.clone().assemble_library([source_code_component2]).unwrap();
     let find_procedure_digest_by_name = |name: &str, lib: &Library| {
         lib.exports().find_map(|export| {
-            if export.name.as_str() == name {
-                Some(lib.mast_forest()[lib.get_export_node_id(export)].digest())
+            if export.name.name.as_str() == name {
+                Some(lib.mast_forest()[lib.get_export_node_id(&export.name)].digest())
             } else {
                 None
             }
@@ -687,7 +698,7 @@ fn test_account_component_storage_offset() -> miette::Result<()> {
     let component1 = AccountComponent::compile(
         source_code_component1,
         assembler.clone(),
-        vec![StorageSlot::Value(Word::default())],
+        vec![StorageSlot::Value(Word::empty())],
     )
     .unwrap()
     .with_supported_type(AccountType::RegularAccountUpdatableCode);
@@ -695,7 +706,7 @@ fn test_account_component_storage_offset() -> miette::Result<()> {
     let component2 = AccountComponent::compile(
         source_code_component2,
         assembler.clone(),
-        vec![StorageSlot::Value(Word::default())],
+        vec![StorageSlot::Value(Word::empty())],
     )
     .unwrap()
     .with_supported_type(AccountType::RegularAccountUpdatableCode);
@@ -750,58 +761,35 @@ fn test_account_component_storage_offset() -> miette::Result<()> {
         .unwrap();
 
     // execute code in context
-    let tx = tx_context.execute().into_diagnostic()?;
+    let tx = tx_context.execute().await.into_diagnostic()?;
     account.apply_delta(tx.account_delta()).unwrap();
 
     // assert that elements have been set at the correct locations in storage
-    assert_eq!(
-        account.storage().get_item(0).unwrap(),
-        [Felt::new(1), Felt::new(2), Felt::new(3), Felt::new(4)].into()
-    );
+    assert_eq!(account.storage().get_item(0).unwrap(), Word::from([1, 2, 3, 4u32]));
 
-    assert_eq!(
-        account.storage().get_item(1).unwrap(),
-        [Felt::new(5), Felt::new(6), Felt::new(7), Felt::new(8)].into()
-    );
+    assert_eq!(account.storage().get_item(1).unwrap(), Word::from([5, 6, 7, 8u32]));
 
     Ok(())
 }
 
 /// Tests that we can successfully create regular and faucet accounts with empty storage.
-#[test]
-fn create_account_with_empty_storage_slots() -> anyhow::Result<()> {
-    // transaction code which only increases the nonce to make the transaction non-empty
-    let default_tx_code = "
-        use.kernel::account 
-        
-        begin 
-            push.1 exec.account::incr_nonce 
-        end";
-
+#[tokio::test]
+async fn create_account_with_empty_storage_slots() -> anyhow::Result<()> {
     for account_type in [AccountType::FungibleFaucet, AccountType::RegularAccountUpdatableCode] {
-        let mock_chain = MockChain::new();
-        let (account, seed) = AccountBuilder::new([5; 32])
+        let account = AccountBuilder::new([5; 32])
             .account_type(account_type)
             .with_auth_component(Auth::IncrNonce)
-            .with_component(
-                AccountMockComponent::new_with_empty_slots(TransactionKernel::testing_assembler())
-                    .unwrap(),
-            )
+            .with_component(MockAccountComponent::with_empty_slots())
             .build()
             .context("failed to build account")?;
 
-        let tx_inputs = mock_chain.get_transaction_inputs(account.clone(), Some(seed), &[], &[])?;
-        let tx_context = TransactionContextBuilder::new(account)
-            .account_seed(Some(seed))
-            .tx_inputs(tx_inputs)
-            .build()?;
-        tx_context.execute_code(default_tx_code)?;
+        TransactionContextBuilder::new(account).build()?.execute().await?;
     }
 
     Ok(())
 }
 
-fn create_procedure_metadata_test_account(
+async fn create_procedure_metadata_test_account(
     account_type: AccountType,
     storage_offset: u8,
     storage_size: u8,
@@ -836,15 +824,13 @@ fn create_procedure_metadata_test_account(
     let id = AccountId::new(seed, version, code.commitment(), storage.commitment())
         .context("failed to compute ID")?;
 
-    let account = Account::from_parts(id, AssetVault::default(), storage, code, Felt::from(0u32));
+    let account =
+        Account::new(id, AssetVault::default(), storage, code, Felt::from(0u32), Some(seed))?;
 
-    let tx_inputs = mock_chain.get_transaction_inputs(account.clone(), Some(seed), &[], &[])?;
-    let tx_context = TransactionContextBuilder::new(account)
-        .account_seed(Some(seed))
-        .tx_inputs(tx_inputs)
-        .build()?;
+    let tx_inputs = mock_chain.get_transaction_inputs(&account, &[], &[])?;
+    let tx_context = TransactionContextBuilder::new(account).tx_inputs(tx_inputs).build()?;
 
-    let result = tx_context.execute().map_err(|err| {
+    let result = tx_context.execute().await.map_err(|err| {
         let TransactionExecutorError::TransactionProgramExecutionFailed(exec_err) = err else {
             panic!("should have received an execution error");
         };
@@ -856,10 +842,12 @@ fn create_procedure_metadata_test_account(
 }
 
 /// Tests that creating an account whose procedure accesses the reserved faucet storage slot fails.
-#[test]
-fn creating_faucet_account_with_procedure_accessing_reserved_slot_fails() -> anyhow::Result<()> {
+#[tokio::test]
+async fn creating_faucet_account_with_procedure_accessing_reserved_slot_fails() -> anyhow::Result<()>
+{
     // Set offset to 0 for a faucet which should be disallowed.
     let execution_res = create_procedure_metadata_test_account(AccountType::FungibleFaucet, 0, 1)
+        .await
         .context("failed to create test account")?;
 
     assert_execution_error!(execution_res, ERR_FAUCET_INVALID_STORAGE_OFFSET);
@@ -868,17 +856,20 @@ fn creating_faucet_account_with_procedure_accessing_reserved_slot_fails() -> any
 }
 
 /// Tests that creating a faucet whose procedure offset+size is out of bounds fails.
-#[test]
-fn creating_faucet_with_procedure_offset_plus_size_out_of_bounds_fails() -> anyhow::Result<()> {
+#[tokio::test]
+async fn creating_faucet_with_procedure_offset_plus_size_out_of_bounds_fails() -> anyhow::Result<()>
+{
     // Set offset to lowest allowed value 1 and size to 1 while number of slots is 1 which should
     // result in an out of bounds error.
     let execution_res = create_procedure_metadata_test_account(AccountType::FungibleFaucet, 1, 1)
+        .await
         .context("failed to create test account")?;
 
     assert_execution_error!(execution_res, ERR_ACCOUNT_STORAGE_SLOT_INDEX_OUT_OF_BOUNDS);
 
     // Set offset to 2 while number of slots is 1 which should result in an out of bounds error.
     let execution_res = create_procedure_metadata_test_account(AccountType::FungibleFaucet, 2, 1)
+        .await
         .context("failed to create test account")?;
 
     assert_execution_error!(execution_res, ERR_ACCOUNT_STORAGE_SLOT_INDEX_OUT_OF_BOUNDS);
@@ -887,11 +878,13 @@ fn creating_faucet_with_procedure_offset_plus_size_out_of_bounds_fails() -> anyh
 }
 
 /// Tests that creating an account whose procedure offset+size is out of bounds fails.
-#[test]
-fn creating_account_with_procedure_offset_plus_size_out_of_bounds_fails() -> anyhow::Result<()> {
+#[tokio::test]
+async fn creating_account_with_procedure_offset_plus_size_out_of_bounds_fails() -> anyhow::Result<()>
+{
     // Set size to 2 while number of slots is 1 which should result in an out of bounds error.
     let execution_res =
         create_procedure_metadata_test_account(AccountType::RegularAccountImmutableCode, 0, 2)
+            .await
             .context("failed to create test account")?;
 
     assert_execution_error!(execution_res, ERR_ACCOUNT_STORAGE_SLOT_INDEX_OUT_OF_BOUNDS);
@@ -899,6 +892,7 @@ fn creating_account_with_procedure_offset_plus_size_out_of_bounds_fails() -> any
     // Set offset to 2 while number of slots is 1 which should result in an out of bounds error.
     let execution_res =
         create_procedure_metadata_test_account(AccountType::RegularAccountImmutableCode, 2, 1)
+            .await
             .context("failed to create test account")?;
 
     assert_execution_error!(execution_res, ERR_ACCOUNT_STORAGE_SLOT_INDEX_OUT_OF_BOUNDS);
@@ -906,42 +900,496 @@ fn creating_account_with_procedure_offset_plus_size_out_of_bounds_fails() -> any
     Ok(())
 }
 
-// ACCOUNT VAULT TESTS
-// ================================================================================================
-
-#[test]
-fn test_get_vault_root() -> anyhow::Result<()> {
+#[tokio::test]
+async fn test_get_initial_storage_commitment() -> anyhow::Result<()> {
     let tx_context = TransactionContextBuilder::with_existing_mock_account().build()?;
 
-    let account = tx_context.account();
     let code = format!(
-        "
-        use.miden::account
-        use.kernel::prologue
+        r#"
+        use.miden::active_account
+        use.$kernel::prologue
 
         begin
             exec.prologue::prepare_transaction
 
-            # push the new storage item onto the stack
-            exec.account::get_vault_root
+            # get the initial storage commitment
+            exec.active_account::get_initial_storage_commitment
+            push.{expected_storage_commitment}
+            assert_eqw.err="actual storage commitment is not equal to the expected one"
+        end
+        "#,
+        expected_storage_commitment = &tx_context.account().storage().commitment(),
+    );
+    tx_context.execute_code(&code).await?;
+
+    Ok(())
+}
+
+/// This test creates an account with mock storage slots and calls the
+/// `compute_storage_commitment` procedure each time the storage is updated.
+///
+/// Namely, we invoke the `mock_account::compute_storage_commitment` procedure:
+/// - Right after the account creation.
+/// - After updating the 0th storage slot (value slot).
+/// - Right after the previous call to make sure it returns the same commitment from the cached
+///   data.
+/// - After updating the 2nd storage slot (map slot).
+#[tokio::test]
+async fn test_compute_storage_commitment() -> anyhow::Result<()> {
+    let tx_context = TransactionContextBuilder::with_existing_mock_account().build().unwrap();
+    let mut account_clone = tx_context.account().clone();
+    let account_storage = account_clone.storage_mut();
+
+    let init_storage_commitment = account_storage.commitment();
+
+    account_storage.set_item(0, [9, 10, 11, 12].map(Felt::new).into())?;
+    let storage_commitment_0 = account_storage.commitment();
+
+    account_storage.set_map_item(
+        2,
+        [101, 102, 103, 104].map(Felt::new).into(),
+        [5, 6, 7, 8].map(Felt::new).into(),
+    )?;
+    let storage_commitment_2 = account_storage.commitment();
+
+    let code = format!(
+        r#"
+        use.miden::account
+        use.$kernel::prologue
+        use.mock::account->mock_account
+
+        begin
+            exec.prologue::prepare_transaction
+
+            # assert the correctness of the initial storage commitment
+            call.mock_account::compute_storage_commitment
+            push.{init_storage_commitment}
+            assert_eqw.err="storage commitment at the beginning of the transaction is not equal to the expected one"
+
+            # update the 0th (value) storage slot
+            push.9.10.11.12.0
+            call.mock_account::set_item dropw drop
+            # => []
+
+            # assert the correctness of the storage commitment after the 0th slot was updated
+            call.mock_account::compute_storage_commitment
+            push.{storage_commitment_0}
+            assert_eqw.err="storage commitment after the 0th slot was updated is not equal to the expected one"
+
+            # get the storage commitment once more to get the cached data and assert that this data
+            # didn't change
+            call.mock_account::compute_storage_commitment
+            push.{storage_commitment_0}
+            assert_eqw.err="storage commitment should remain the same"
+
+            # update the 2nd (map) storage slot
+            push.5.6.7.8.101.102.103.104.2 # [idx, KEY, VALUE]
+            call.mock_account::set_map_item dropw dropw
+            # => []
+
+            # assert the correctness of the storage commitment after the 2nd slot was updated
+            call.mock_account::compute_storage_commitment
+            push.{storage_commitment_2}
+            assert_eqw.err="storage commitment after the 2nd slot was updated is not equal to the expected one"
+        end
+        "#,
+    );
+    tx_context.execute_code(&code).await?;
+
+    Ok(())
+}
+
+/// Tests that an account with a non-empty map can be created.
+///
+/// In particular, this tests the account delta logic for (non-empty) storage slots for _new_
+/// accounts.
+#[tokio::test]
+async fn prove_account_creation_with_non_empty_storage() -> anyhow::Result<()> {
+    let slot0 = StorageSlot::Value(Word::from([1, 2, 3, 4u32]));
+    let slot1 = StorageSlot::Value(Word::from([10, 20, 30, 40u32]));
+    let mut map_entries = Vec::new();
+    for _ in 0..10 {
+        map_entries.push((rand_value::<Word>(), rand_value::<Word>()));
+    }
+    let map_slot = StorageSlot::Map(StorageMap::with_entries(map_entries.clone())?);
+
+    let account = AccountBuilder::new([6; 32])
+        .storage_mode(AccountStorageMode::Public)
+        .with_auth_component(Auth::IncrNonce)
+        .with_component(MockAccountComponent::with_slots(vec![
+            slot0.clone(),
+            slot1.clone(),
+            map_slot,
+        ]))
+        .build()?;
+
+    let tx = TransactionContextBuilder::new(account)
+        .build()?
+        .execute()
+        .await
+        .context("failed to execute account-creating transaction")?;
+
+    assert_eq!(tx.account_delta().nonce_delta(), Felt::new(1));
+
+    assert_eq!(tx.account_delta().storage().values().get(&0).unwrap(), &slot0.value());
+    assert_eq!(tx.account_delta().storage().values().get(&1).unwrap(), &slot1.value());
+
+    assert_eq!(
+        tx.account_delta().storage().maps().get(&2).unwrap().entries(),
+        &BTreeMap::from_iter(
+            map_entries
+                .into_iter()
+                .map(|(key, value)| { (LexicographicWord::new(key), value) })
+        )
+    );
+
+    assert!(tx.account_delta().vault().is_empty());
+    assert_eq!(tx.final_account().nonce(), Felt::new(1));
+
+    let proven_tx = LocalTransactionProver::default().prove(tx.clone())?;
+
+    // The delta should be present on the proven tx.
+    let AccountUpdateDetails::Delta(delta) = proven_tx.account_update().details() else {
+        panic!("expected delta");
+    };
+    assert_eq!(delta, tx.account_delta());
+
+    Ok(())
+}
+
+// ACCOUNT VAULT TESTS
+// ================================================================================================
+
+#[tokio::test]
+async fn test_get_vault_root() -> anyhow::Result<()> {
+    let tx_context = TransactionContextBuilder::with_existing_mock_account().build()?;
+
+    let mut account = tx_context.account().clone();
+
+    let fungible_asset = Asset::Fungible(
+        FungibleAsset::new(
+            AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).context("id should be valid")?,
+            5,
+        )
+        .context("fungible_asset_0 is invalid")?,
+    );
+
+    // get the initial vault root
+    let code = format!(
+        "
+        use.miden::active_account
+        use.$kernel::prologue
+
+        begin
+            exec.prologue::prepare_transaction
+
+            # get the initial vault root
+            exec.active_account::get_initial_vault_root
             push.{expected_vault_root}
             assert_eqw
         end
         ",
-        expected_vault_root = word_to_masm_push_string(&account.vault().root()),
+        expected_vault_root = &account.vault().root(),
+    );
+    tx_context.execute_code(&code).await?;
+
+    // get the current vault root
+    account.vault_mut().add_asset(fungible_asset)?;
+
+    let code = format!(
+        r#"
+        use.miden::active_account
+        use.$kernel::prologue
+        use.mock::account->mock_account
+
+        begin
+            exec.prologue::prepare_transaction
+
+            # add an asset to the account
+            push.{fungible_asset}
+            call.mock_account::add_asset dropw
+            # => []
+
+            # get the current vault root
+            exec.active_account::get_vault_root
+            push.{expected_vault_root}
+            assert_eqw.err="actual vault root is not equal to the expected one"
+        end
+        "#,
+        fungible_asset = Word::from(&fungible_asset),
+        expected_vault_root = &account.vault().root(),
+    );
+    tx_context.execute_code(&code).await?;
+
+    Ok(())
+}
+
+/// This test checks the correctness of the `miden::active_account::get_initial_balance` procedure
+/// in two cases:
+/// - when a note adds the asset which already exists in the account vault.
+/// - when a note adds the asset which doesn't exist in the account vault.
+///  
+/// As part of the test pipeline it also checks the correctness of the
+/// `miden::active_account::get_balance` procedure.
+#[tokio::test]
+async fn test_get_init_balance_addition() -> anyhow::Result<()> {
+    // prepare the testing data
+    // ------------------------------------------
+    let mut builder = MockChain::builder();
+
+    let faucet_existing_asset =
+        AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).context("id should be valid")?;
+    let faucet_new_asset =
+        AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1).context("id should be valid")?;
+
+    let fungible_asset_for_account = Asset::Fungible(
+        FungibleAsset::new(faucet_existing_asset, 10).context("fungible_asset_0 is invalid")?,
+    );
+    let account = builder
+        .add_existing_wallet_with_assets(crate::Auth::BasicAuth, [fungible_asset_for_account])?;
+
+    let fungible_asset_for_note_existing = Asset::Fungible(
+        FungibleAsset::new(faucet_existing_asset, 7).context("fungible_asset_0 is invalid")?,
     );
 
-    tx_context.execute_code(&code)?;
+    let fungible_asset_for_note_new = Asset::Fungible(
+        FungibleAsset::new(faucet_new_asset, 20).context("fungible_asset_1 is invalid")?,
+    );
+
+    let p2id_note_existing_asset = builder.add_p2id_note(
+        ACCOUNT_ID_SENDER.try_into().unwrap(),
+        account.id(),
+        &[fungible_asset_for_note_existing],
+        NoteType::Public,
+    )?;
+    let p2id_note_new_asset = builder.add_p2id_note(
+        ACCOUNT_ID_SENDER.try_into().unwrap(),
+        account.id(),
+        &[fungible_asset_for_note_new],
+        NoteType::Public,
+    )?;
+
+    let mut mock_chain = builder.build()?;
+    mock_chain.prove_next_block()?;
+
+    // case 1: existing asset was added to the account
+    // ------------------------------------------
+
+    let initial_balance = account
+        .vault()
+        .get_balance(faucet_existing_asset)
+        .expect("faucet_id should be a fungible faucet ID");
+
+    let add_existing_source = format!(
+        r#"
+        use.miden::active_account
+
+        begin
+            # push faucet ID prefix and suffix
+            push.{suffix}.{prefix}
+            # => [faucet_id_prefix, faucet_id_suffix]
+
+            # get the current asset balance
+            dup.1 dup.1 exec.active_account::get_balance
+            # => [final_balance, faucet_id_prefix, faucet_id_suffix]
+
+            # assert final balance is correct
+            push.{final_balance}
+            assert_eq.err="final balance is incorrect"
+            # => [faucet_id_prefix, faucet_id_suffix]
+
+            # get the initial asset balance
+            exec.active_account::get_initial_balance
+            # => [init_balance]
+
+            # assert initial balance is correct
+            push.{initial_balance}
+            assert_eq.err="initial balance is incorrect"
+        end
+    "#,
+        suffix = faucet_existing_asset.suffix(),
+        prefix = faucet_existing_asset.prefix().as_felt(),
+        final_balance =
+            initial_balance + fungible_asset_for_note_existing.unwrap_fungible().amount(),
+    );
+
+    let tx_script = ScriptBuilder::default().compile_tx_script(add_existing_source)?;
+
+    let tx_context = mock_chain
+        .build_tx_context(
+            TxContextInput::AccountId(account.id()),
+            &[],
+            &[p2id_note_existing_asset],
+        )?
+        .tx_script(tx_script)
+        .build()?;
+
+    tx_context.execute().await?;
+
+    // case 2: new asset was added to the account
+    // ------------------------------------------
+
+    let initial_balance = account
+        .vault()
+        .get_balance(faucet_new_asset)
+        .expect("faucet_id should be a fungible faucet ID");
+
+    let add_new_source = format!(
+        r#"
+        use.miden::active_account
+
+        begin
+            # push faucet ID prefix and suffix
+            push.{suffix}.{prefix}
+            # => [faucet_id_prefix, faucet_id_suffix]
+
+            # get the current asset balance
+            dup.1 dup.1 exec.active_account::get_balance
+            # => [final_balance, faucet_id_prefix, faucet_id_suffix]
+
+            # assert final balance is correct
+            push.{final_balance}
+            assert_eq.err="final balance is incorrect"
+            # => [faucet_id_prefix, faucet_id_suffix]
+
+            # get the initial asset balance
+            exec.active_account::get_initial_balance
+            # => [init_balance]
+
+            # assert initial balance is correct
+            push.{initial_balance}
+            assert_eq.err="initial balance is incorrect"
+        end
+    "#,
+        suffix = faucet_new_asset.suffix(),
+        prefix = faucet_new_asset.prefix().as_felt(),
+        final_balance = initial_balance + fungible_asset_for_note_new.unwrap_fungible().amount(),
+    );
+
+    let tx_script = ScriptBuilder::default().compile_tx_script(add_new_source)?;
+
+    let tx_context = mock_chain
+        .build_tx_context(TxContextInput::AccountId(account.id()), &[], &[p2id_note_new_asset])?
+        .tx_script(tx_script)
+        .build()?;
+
+    tx_context.execute().await?;
+
+    Ok(())
+}
+
+/// This test checks the correctness of the `miden::active_account::get_initial_balance` procedure
+/// in case when we create a note which removes an asset from the account vault.
+///  
+/// As part of the test pipeline it also checks the correctness of the
+/// `miden::active_account::get_balance` procedure.
+#[tokio::test]
+async fn test_get_init_balance_subtraction() -> anyhow::Result<()> {
+    let mut builder = MockChain::builder();
+
+    let faucet_existing_asset =
+        AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).context("id should be valid")?;
+
+    let fungible_asset_for_account = Asset::Fungible(
+        FungibleAsset::new(faucet_existing_asset, 10).context("fungible_asset_0 is invalid")?,
+    );
+    let account = builder
+        .add_existing_wallet_with_assets(crate::Auth::BasicAuth, [fungible_asset_for_account])?;
+
+    let fungible_asset_for_note_existing = Asset::Fungible(
+        FungibleAsset::new(faucet_existing_asset, 7).context("fungible_asset_0 is invalid")?,
+    );
+
+    let mut mock_chain = builder.build()?;
+    mock_chain.prove_next_block()?;
+
+    let initial_balance = account
+        .vault()
+        .get_balance(faucet_existing_asset)
+        .expect("faucet_id should be a fungible faucet ID");
+
+    let expected_output_note =
+        create_public_p2any_note(ACCOUNT_ID_SENDER.try_into()?, [fungible_asset_for_note_existing]);
+
+    let remove_existing_source = format!(
+        r#"
+        use.miden::active_account
+        use.miden::contracts::wallets::basic->wallet
+        use.mock::util
+
+        # Inputs:  [ASSET, note_idx]
+        # Outputs: [ASSET, note_idx]
+        proc.move_asset_to_note
+            # pad the stack before call
+            push.0.0.0 movdn.7 movdn.7 movdn.7 padw padw swapdw
+            # => [ASSET, note_idx, pad(11)]
+
+            call.wallet::move_asset_to_note
+            # => [ASSET, note_idx, pad(11)]
+
+            # remove excess PADs from the stack
+            swapdw dropw dropw swapw movdn.7 drop drop drop
+            # => [ASSET, note_idx]
+        end
+
+        begin
+            # create random note and move the asset into it
+            exec.util::create_random_note
+            # => [note_idx]
+
+            push.{REMOVED_ASSET}
+            exec.move_asset_to_note dropw drop
+            # => []
+
+            # push faucet ID prefix and suffix
+            push.{suffix}.{prefix}
+            # => [faucet_id_prefix, faucet_id_suffix]
+
+            # get the current asset balance
+            dup.1 dup.1 exec.active_account::get_balance
+            # => [final_balance, faucet_id_prefix, faucet_id_suffix]
+
+            # assert final balance is correct
+            push.{final_balance}
+            assert_eq.err="final balance is incorrect"
+            # => [faucet_id_prefix, faucet_id_suffix]
+
+            # get the initial asset balance
+            exec.active_account::get_initial_balance
+            # => [init_balance]
+
+            # assert initial balance is correct
+            push.{initial_balance}
+            assert_eq.err="initial balance is incorrect"
+        end
+    "#,
+        REMOVED_ASSET = Word::from(fungible_asset_for_note_existing),
+        suffix = faucet_existing_asset.suffix(),
+        prefix = faucet_existing_asset.prefix().as_felt(),
+        final_balance =
+            initial_balance - fungible_asset_for_note_existing.unwrap_fungible().amount(),
+    );
+
+    let tx_script =
+        ScriptBuilder::with_mock_libraries()?.compile_tx_script(remove_existing_source)?;
+
+    let tx_context = mock_chain
+        .build_tx_context(TxContextInput::AccountId(account.id()), &[], &[])?
+        .tx_script(tx_script)
+        .extend_expected_output_notes(vec![OutputNote::Full(expected_output_note)])
+        .build()?;
+
+    tx_context.execute().await?;
+
     Ok(())
 }
 
 // PROCEDURE AUTHENTICATION TESTS
 // ================================================================================================
 
-#[test]
-fn test_authenticate_and_track_procedure() -> miette::Result<()> {
-    let mock_component =
-        AccountMockComponent::new_with_empty_slots(TransactionKernel::assembler()).unwrap();
+#[tokio::test]
+async fn test_authenticate_and_track_procedure() -> miette::Result<()> {
+    let mock_component = MockAccountComponent::with_empty_slots();
 
     let account_code = AccountCode::from_components(
         &[Auth::IncrNonce.into(), mock_component.into()],
@@ -949,23 +1397,20 @@ fn test_authenticate_and_track_procedure() -> miette::Result<()> {
     )
     .unwrap();
 
-    let tc_0: [Felt; 4] =
-        account_code.procedures()[1].mast_root().as_elements().try_into().unwrap();
-    let tc_1: [Felt; 4] =
-        account_code.procedures()[2].mast_root().as_elements().try_into().unwrap();
-    let tc_2: [Felt; 4] =
-        account_code.procedures()[3].mast_root().as_elements().try_into().unwrap();
+    let tc_0 = *account_code.procedures()[1].mast_root();
+    let tc_1 = *account_code.procedures()[2].mast_root();
+    let tc_2 = *account_code.procedures()[3].mast_root();
 
     let test_cases =
-        vec![(tc_0, true), (tc_1, true), (tc_2, true), ([ONE, ZERO, ONE, ZERO], false)];
+        vec![(tc_0, true), (tc_1, true), (tc_2, true), (Word::from([1, 0, 1, 0u32]), false)];
 
     for (root, valid) in test_cases.into_iter() {
         let tx_context = TransactionContextBuilder::with_existing_mock_account().build().unwrap();
 
         let code = format!(
             "
-            use.kernel::account
-            use.kernel::prologue
+            use.$kernel::account
+            use.$kernel::prologue
 
             begin
                 exec.prologue::prepare_transaction
@@ -978,16 +1423,20 @@ fn test_authenticate_and_track_procedure() -> miette::Result<()> {
                 dropw
             end
             ",
-            root = word_to_masm_push_string(&root)
+            root = &root,
         );
 
         // Execution of this code will return an EventError(UnknownAccountProcedure) for procs
         // that are not in the advice provider.
-        let process = tx_context.execute_code(&code);
+        let exec_output = tx_context.execute_code(&code).await;
 
         match valid {
-            true => assert!(process.is_ok(), "A valid procedure must successfully authenticate"),
-            false => assert!(process.is_err(), "An invalid procedure should fail to authenticate"),
+            true => {
+                assert!(exec_output.is_ok(), "A valid procedure must successfully authenticate")
+            },
+            false => {
+                assert!(exec_output.is_err(), "An invalid procedure should fail to authenticate")
+            },
         }
     }
 
@@ -997,14 +1446,10 @@ fn test_authenticate_and_track_procedure() -> miette::Result<()> {
 // PROCEDURE INTROSPECTION TESTS
 // ================================================================================================
 
-#[test]
-fn test_was_procedure_called() -> miette::Result<()> {
+#[tokio::test]
+async fn test_was_procedure_called() -> miette::Result<()> {
     // Create a standard account using the mock component
-    let mock_component = AccountMockComponent::new_with_slots(
-        TransactionKernel::assembler(),
-        AccountStorage::mock_storage_slots(),
-    )
-    .unwrap();
+    let mock_component = MockAccountComponent::with_slots(AccountStorage::mock_storage_slots());
     let account = AccountBuilder::new(ChaCha20Rng::from_os_rng().random())
         .with_auth_component(Auth::IncrNonce)
         .with_component(mock_component)
@@ -1018,49 +1463,350 @@ fn test_was_procedure_called() -> miette::Result<()> {
     // 4. Calls get_item **again**
     // 5. Checks that `was_procedure_called` returns `true`
     let tx_script_code = r#"
-        use.test::account->test_account
-        use.miden::account
+        use.mock::account->mock_account
+        use.miden::native_account
 
         begin
             # First check that get_item procedure hasn't been called yet
-            procref.test_account::get_item
-            exec.account::was_procedure_called
+            procref.mock_account::get_item
+            exec.native_account::was_procedure_called
             assertz.err="procedure should not have been called"
 
             # Call the procedure first time
             push.0
-            call.test_account::get_item dropw
+            call.mock_account::get_item dropw
             # => []
 
-            procref.test_account::get_item
-            exec.account::was_procedure_called
+            procref.mock_account::get_item
+            exec.native_account::was_procedure_called
             assert.err="procedure should have been called"
 
             # Call the procedure second time
             push.0
-            call.test_account::get_item dropw
+            call.mock_account::get_item dropw
 
-            procref.test_account::get_item
-            exec.account::was_procedure_called
+            procref.mock_account::get_item
+            exec.native_account::was_procedure_called
             assert.err="2nd call should not change the was_called flag"
         end
         "#;
 
     // Compile the transaction script using the testing assembler with mock account
-    let assembler = TransactionKernel::testing_assembler_with_mock_account();
-    let tx_script = TransactionScript::new(
-        assembler
-            .assemble_program(tx_script_code)
-            .wrap_err("Failed to compile transaction script")?,
-    );
+    let tx_script = ScriptBuilder::with_mock_libraries()
+        .into_diagnostic()?
+        .compile_tx_script(tx_script_code)
+        .into_diagnostic()?;
 
     // Create transaction context and execute
     let tx_context = TransactionContextBuilder::new(account).tx_script(tx_script).build().unwrap();
 
     tx_context
         .execute()
+        .await
         .into_diagnostic()
         .wrap_err("Failed to execute transaction")?;
+
+    Ok(())
+}
+
+/// Tests that an account can call code in a custom library when loading that library into the
+/// executor.
+///
+/// The call chain and dependency graph in this test is:
+/// `tx script -> account code -> external library`
+#[tokio::test]
+async fn transaction_executor_account_code_using_custom_library() -> miette::Result<()> {
+    const EXTERNAL_LIBRARY_CODE: &str = r#"
+      use.miden::native_account
+
+      export.external_setter
+        push.2.3.4.5
+        push.0
+        exec.native_account::set_item
+        dropw dropw
+      end"#;
+
+    const ACCOUNT_COMPONENT_CODE: &str = "
+      use.external_library::external_module
+
+      export.custom_setter
+        exec.external_module::external_setter
+      end";
+
+    let external_library_source =
+        NamedSource::new("external_library::external_module", EXTERNAL_LIBRARY_CODE);
+    let external_library =
+        TransactionKernel::assembler().assemble_library([external_library_source])?;
+
+    let mut assembler =
+        TransactionKernel::with_mock_libraries(Arc::new(DefaultSourceManager::default()));
+    assembler.link_static_library(&external_library)?;
+
+    let account_component_source =
+        NamedSource::new("account_component::account_module", ACCOUNT_COMPONENT_CODE);
+    let account_component_lib =
+        assembler.clone().assemble_library([account_component_source]).unwrap();
+
+    let tx_script_src = "\
+          use.account_component::account_module
+
+          begin
+            call.account_module::custom_setter
+          end";
+
+    let account_component =
+        AccountComponent::new(account_component_lib.clone(), AccountStorage::mock_storage_slots())
+            .into_diagnostic()?
+            .with_supports_all_types();
+
+    // Build an existing account with nonce 1.
+    let native_account = AccountBuilder::new(ChaCha20Rng::from_os_rng().random())
+        .with_auth_component(Auth::IncrNonce)
+        .with_component(account_component)
+        .build_existing()
+        .into_diagnostic()?;
+
+    let tx_script = ScriptBuilder::default()
+        .with_dynamically_linked_library(&account_component_lib)
+        .into_diagnostic()?
+        .compile_tx_script(tx_script_src)
+        .into_diagnostic()?;
+
+    let tx_context = TransactionContextBuilder::new(native_account.clone())
+        .tx_script(tx_script)
+        .build()
+        .unwrap();
+
+    let executed_tx = tx_context.execute().await.into_diagnostic()?;
+
+    // Account's initial nonce of 1 should have been incremented by 1.
+    assert_eq!(executed_tx.account_delta().nonce_delta(), Felt::new(1));
+
+    // Make sure that account storage has been updated as per the tx script call.
+    assert_eq!(
+        *executed_tx.account_delta().storage().values(),
+        BTreeMap::from([(0, Word::from([2, 3, 4, 5u32]))]),
+    );
+    Ok(())
+}
+
+/// Tests that incrementing the account nonce twice fails.
+#[tokio::test]
+async fn incrementing_nonce_twice_fails() -> anyhow::Result<()> {
+    let source_code = "
+        use.miden::native_account
+
+        export.auth_incr_nonce_twice
+            exec.native_account::incr_nonce drop
+            exec.native_account::incr_nonce drop
+        end
+    ";
+
+    let faulty_auth_component =
+        AccountComponent::compile(source_code, TransactionKernel::assembler(), vec![])?
+            .with_supports_all_types();
+    let account = AccountBuilder::new([5; 32])
+        .with_auth_component(faulty_auth_component)
+        .with_component(MockAccountComponent::with_empty_slots())
+        .build()
+        .context("failed to build account")?;
+
+    let result = TransactionContextBuilder::new(account).build()?.execute().await;
+
+    assert_transaction_executor_error!(result, ERR_ACCOUNT_NONCE_CAN_ONLY_BE_INCREMENTED_ONCE);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_has_procedure() -> miette::Result<()> {
+    // Create a standard account using the mock component
+    let mock_component = MockAccountComponent::with_slots(AccountStorage::mock_storage_slots());
+    let account = AccountBuilder::new(ChaCha20Rng::from_os_rng().random())
+        .with_auth_component(Auth::IncrNonce)
+        .with_component(mock_component)
+        .build_existing()
+        .unwrap();
+
+    let tx_script_code = r#"
+        use.mock::account->mock_account
+        use.miden::active_account
+
+        begin
+            # check that get_item procedure is available on the mock account
+            procref.mock_account::get_item
+            # => [GET_ITEM_ROOT]
+
+            exec.active_account::has_procedure
+            # => [is_procedure_available]
+
+            # assert that the get_item is exposed
+            assert.err="get_item procedure should be exposed by the mock account"
+
+            # get some random word and assert that it is not exposed
+            push.5.3.15.686
+
+            exec.active_account::has_procedure
+            # => [is_procedure_available]
+
+            # assert that the procedure with some random root is not exposed
+            assertz.err="procedure with some random root should not be exposed by the mock account"
+        end
+        "#;
+
+    // Compile the transaction script using the testing assembler with mock account
+    let tx_script = ScriptBuilder::with_mock_libraries()
+        .into_diagnostic()?
+        .compile_tx_script(tx_script_code)
+        .into_diagnostic()?;
+
+    // Create transaction context and execute
+    let tx_context = TransactionContextBuilder::new(account).tx_script(tx_script).build().unwrap();
+
+    tx_context
+        .execute()
+        .await
+        .into_diagnostic()
+        .wrap_err("Failed to execute transaction")?;
+
+    Ok(())
+}
+
+// ACCOUNT INITIAL STORAGE TESTS
+// ================================================================================================
+
+#[tokio::test]
+async fn test_get_initial_item() -> miette::Result<()> {
+    let tx_context = TransactionContextBuilder::with_existing_mock_account().build().unwrap();
+
+    // Test that get_initial_item returns the initial value before any changes
+    let code = format!(
+        "
+        use.$kernel::account
+        use.$kernel::prologue
+        use.mock::account->mock_account
+
+        begin
+            exec.prologue::prepare_transaction
+
+            # get initial value of storage slot 0
+            push.0
+            exec.account::get_initial_item
+
+            push.{expected_initial_value}
+            assert_eqw.err=\"initial value should match expected\"
+
+            # modify the storage slot
+            push.9.10.11.12.0
+            call.mock_account::set_item dropw drop
+
+            # get_item should return the new value
+            push.0
+            exec.account::get_item
+            push.9.10.11.12
+            assert_eqw.err=\"current value should be updated\"
+
+            # get_initial_item should still return the initial value
+            push.0
+            exec.account::get_initial_item
+            push.{expected_initial_value}
+            assert_eqw.err=\"initial value should remain unchanged\"
+        end
+        ",
+        expected_initial_value = &AccountStorage::mock_item_0().slot.value(),
+    );
+
+    tx_context.execute_code(&code).await.unwrap();
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_get_initial_map_item() -> miette::Result<()> {
+    let account = AccountBuilder::new(ChaCha20Rng::from_os_rng().random())
+        .with_auth_component(Auth::IncrNonce)
+        .with_component(MockAccountComponent::with_slots(vec![AccountStorage::mock_item_2().slot]))
+        .build_existing()
+        .unwrap();
+
+    let tx_context = TransactionContextBuilder::new(account).build().unwrap();
+
+    // Use the first key-value pair from the mock storage
+    let (initial_key, initial_value) = STORAGE_LEAVES_2[0];
+    let new_key = Word::from([201, 202, 203, 204u32]);
+    let new_value = Word::from([301, 302, 303, 304u32]);
+
+    let code = format!(
+        "
+        use.$kernel::prologue
+        use.mock::account->mock_account
+
+        begin
+            exec.prologue::prepare_transaction
+
+            # get initial value from map
+            push.{initial_key}
+            push.0
+            call.mock_account::get_initial_map_item
+            push.{initial_value}
+            assert_eqw.err=\"initial map value should match expected\"
+
+            # add a new key-value pair to the map
+            push.{new_value}
+            push.{new_key}
+            push.0
+            call.mock_account::set_map_item dropw dropw
+
+            # get_map_item should return the new value
+            push.{new_key}
+            push.0
+            call.mock_account::get_map_item
+            push.{new_value}
+            assert_eqw.err=\"current map value should be updated\"
+
+            # get_initial_map_item should still return the initial value for the initial key
+            push.{initial_key}
+            push.0
+            call.mock_account::get_initial_map_item
+            push.{initial_value}
+            assert_eqw.err=\"initial map value should remain unchanged\"
+
+            # get_initial_map_item for the new key should return empty word (default)
+            push.{new_key}
+            push.0
+            call.mock_account::get_initial_map_item
+            padw
+            assert_eqw.err=\"new key should have empty initial value\"
+
+            dropw dropw
+        end
+        ",
+        initial_key = &initial_key,
+        initial_value = &initial_value,
+        new_key = &new_key,
+        new_value = &new_value,
+    );
+
+    tx_context.execute_code(&code).await.unwrap();
+
+    Ok(())
+}
+
+/// Tests that incrementing the account nonce fails if it would overflow the field.
+#[tokio::test]
+async fn incrementing_nonce_overflow_fails() -> anyhow::Result<()> {
+    let mut account = AccountBuilder::new([42; 32])
+        .with_auth_component(Auth::IncrNonce)
+        .with_component(MockAccountComponent::with_empty_slots())
+        .build_existing()
+        .context("failed to build account")?;
+    // Increment the nonce to the maximum felt value. The nonce is already 1, so we increment by
+    // modulus - 2.
+    account.increment_nonce(Felt::new(Felt::MODULUS - 2))?;
+
+    let result = TransactionContextBuilder::new(account).build()?.execute().await;
+
+    assert_transaction_executor_error!(result, ERR_ACCOUNT_NONCE_AT_MAX);
 
     Ok(())
 }

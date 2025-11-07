@@ -1,14 +1,29 @@
 use alloc::vec::Vec;
-use core::cell::OnceCell;
 
 use super::{
-    Account, AccountDelta, AccountHeader, AccountId, AdviceInputs, BlockHeader, InputNote,
-    InputNotes, NoteId, OutputNotes, TransactionArgs, TransactionId, TransactionInputs,
-    TransactionOutputs, TransactionWitness,
+    AccountDelta,
+    AccountHeader,
+    AccountId,
+    AdviceInputs,
+    BlockHeader,
+    InputNote,
+    InputNotes,
+    NoteId,
+    OutputNotes,
+    TransactionArgs,
+    TransactionId,
+    TransactionOutputs,
 };
-use crate::{
-    block::BlockNumber,
-    utils::serde::{ByteReader, ByteWriter, Deserializable, DeserializationError, Serializable},
+use crate::account::PartialAccount;
+use crate::asset::FungibleAsset;
+use crate::block::BlockNumber;
+use crate::transaction::TransactionInputs;
+use crate::utils::serde::{
+    ByteReader,
+    ByteWriter,
+    Deserializable,
+    DeserializationError,
+    Serializable,
 };
 
 // EXECUTED TRANSACTION
@@ -26,12 +41,10 @@ use crate::{
 ///   witness).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutedTransaction {
-    id: OnceCell<TransactionId>,
+    id: TransactionId,
     tx_inputs: TransactionInputs,
     tx_outputs: TransactionOutputs,
     account_delta: AccountDelta,
-    tx_args: TransactionArgs,
-    advice_witness: AdviceInputs,
     tx_measurements: TransactionMeasurements,
 }
 
@@ -47,20 +60,25 @@ impl ExecutedTransaction {
         tx_inputs: TransactionInputs,
         tx_outputs: TransactionOutputs,
         account_delta: AccountDelta,
-        tx_args: TransactionArgs,
-        advice_witness: AdviceInputs,
         tx_measurements: TransactionMeasurements,
     ) -> Self {
         // make sure account IDs are consistent across transaction inputs and outputs
         assert_eq!(tx_inputs.account().id(), tx_outputs.account.id());
 
+        // we create the id from the content, so we cannot construct the
+        // `id` value after construction `Self {..}` without moving
+        let id = TransactionId::new(
+            tx_inputs.account().initial_commitment(),
+            tx_outputs.account.commitment(),
+            tx_inputs.input_notes().commitment(),
+            tx_outputs.output_notes.commitment(),
+        );
+
         Self {
-            id: OnceCell::new(),
+            id,
             tx_inputs,
             tx_outputs,
             account_delta,
-            tx_args,
-            advice_witness,
             tx_measurements,
         }
     }
@@ -70,7 +88,7 @@ impl ExecutedTransaction {
 
     /// Returns a unique identifier of this transaction.
     pub fn id(&self) -> TransactionId {
-        *self.id.get_or_init(|| self.into())
+        self.id
     }
 
     /// Returns the ID of the account against which this transaction was executed.
@@ -78,12 +96,12 @@ impl ExecutedTransaction {
         self.initial_account().id()
     }
 
-    /// Returns the description of the account before the transaction was executed.
-    pub fn initial_account(&self) -> &Account {
+    /// Returns the partial state of the account before the transaction was executed.
+    pub fn initial_account(&self) -> &PartialAccount {
         self.tx_inputs.account()
     }
 
-    /// Returns description of the account after the transaction was executed.
+    /// Returns the header of the account state after the transaction was executed.
     pub fn final_account(&self) -> &AccountHeader {
         &self.tx_outputs.account
     }
@@ -98,6 +116,11 @@ impl ExecutedTransaction {
         &self.tx_outputs.output_notes
     }
 
+    /// Returns the fee of the transaction.
+    pub fn fee(&self) -> FungibleAsset {
+        self.tx_outputs.fee
+    }
+
     /// Returns the block number at which the transaction will expire.
     pub fn expiration_block_num(&self) -> BlockNumber {
         self.tx_outputs.expiration_block_num
@@ -105,7 +128,7 @@ impl ExecutedTransaction {
 
     /// Returns a reference to the transaction arguments.
     pub fn tx_args(&self) -> &TransactionArgs {
-        &self.tx_args
+        self.tx_inputs.tx_args()
     }
 
     /// Returns the block header for the block against which the transaction was executed.
@@ -126,7 +149,7 @@ impl ExecutedTransaction {
     /// Returns all the data requested by the VM from the advice provider while executing the
     /// transaction program.
     pub fn advice_witness(&self) -> &AdviceInputs {
-        &self.advice_witness
+        self.tx_inputs.advice_inputs()
     }
 
     /// Returns a reference to the transaction measurements which are the cycle counts for
@@ -141,20 +164,14 @@ impl ExecutedTransaction {
     /// Returns individual components of this transaction.
     pub fn into_parts(
         self,
-    ) -> (AccountDelta, TransactionOutputs, TransactionWitness, TransactionMeasurements) {
-        let tx_witness = TransactionWitness {
-            tx_inputs: self.tx_inputs,
-            tx_args: self.tx_args,
-            advice_witness: self.advice_witness,
-        };
-        (self.account_delta, self.tx_outputs, tx_witness, self.tx_measurements)
+    ) -> (TransactionInputs, TransactionOutputs, AccountDelta, TransactionMeasurements) {
+        (self.tx_inputs, self.tx_outputs, self.account_delta, self.tx_measurements)
     }
 }
 
-impl From<ExecutedTransaction> for TransactionWitness {
+impl From<ExecutedTransaction> for TransactionInputs {
     fn from(tx: ExecutedTransaction) -> Self {
-        let (_, _, tx_witness, _) = tx.into_parts();
-        tx_witness
+        tx.tx_inputs
     }
 }
 
@@ -170,8 +187,6 @@ impl Serializable for ExecutedTransaction {
         self.tx_inputs.write_into(target);
         self.tx_outputs.write_into(target);
         self.account_delta.write_into(target);
-        self.tx_args.write_into(target);
-        self.advice_witness.write_into(target);
         self.tx_measurements.write_into(target);
     }
 }
@@ -181,18 +196,9 @@ impl Deserializable for ExecutedTransaction {
         let tx_inputs = TransactionInputs::read_from(source)?;
         let tx_outputs = TransactionOutputs::read_from(source)?;
         let account_delta = AccountDelta::read_from(source)?;
-        let tx_args = TransactionArgs::read_from(source)?;
-        let advice_witness = AdviceInputs::read_from(source)?;
         let tx_measurements = TransactionMeasurements::read_from(source)?;
 
-        Ok(Self::new(
-            tx_inputs,
-            tx_outputs,
-            account_delta,
-            tx_args,
-            advice_witness,
-            tx_measurements,
-        ))
+        Ok(Self::new(tx_inputs, tx_outputs, account_delta, tx_measurements))
     }
 }
 
@@ -208,6 +214,13 @@ pub struct TransactionMeasurements {
     pub note_execution: Vec<(NoteId, usize)>,
     pub tx_script_processing: usize,
     pub epilogue: usize,
+    pub auth_procedure: usize,
+    /// The number of cycles the epilogue took to execute after compute_fee determined the cycle
+    /// count.
+    ///
+    /// This is used to get the total number of cycles the transaction takes for use in
+    /// compute_fee itself.
+    pub after_tx_cycles_obtained: usize,
 }
 
 impl TransactionMeasurements {
@@ -231,6 +244,8 @@ impl Serializable for TransactionMeasurements {
         self.note_execution.write_into(target);
         self.tx_script_processing.write_into(target);
         self.epilogue.write_into(target);
+        self.auth_procedure.write_into(target);
+        self.after_tx_cycles_obtained.write_into(target);
     }
 }
 
@@ -241,6 +256,8 @@ impl Deserializable for TransactionMeasurements {
         let note_execution = Vec::<(NoteId, usize)>::read_from(source)?;
         let tx_script_processing = usize::read_from(source)?;
         let epilogue = usize::read_from(source)?;
+        let auth_procedure = usize::read_from(source)?;
+        let after_tx_cycles_obtained = usize::read_from(source)?;
 
         Ok(Self {
             prologue,
@@ -248,6 +265,26 @@ impl Deserializable for TransactionMeasurements {
             note_execution,
             tx_script_processing,
             epilogue,
+            auth_procedure,
+            after_tx_cycles_obtained,
         })
+    }
+}
+
+// TESTS
+// ================================================================================================
+
+#[cfg(test)]
+mod tests {
+    use core::marker::PhantomData;
+
+    use crate::transaction::ExecutedTransaction;
+
+    fn ensure_send<T: Send>(_: PhantomData<T>) {}
+
+    /// Add assurance `ExecutedTransaction` remains `Send`
+    #[allow(dead_code)]
+    fn compiletime_ensure_send_for_types() {
+        ensure_send::<ExecutedTransaction>(PhantomData);
     }
 }

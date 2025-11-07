@@ -1,11 +1,15 @@
-use alloc::vec::Vec;
 use core::fmt::Debug;
 
-use miden_crypto::Felt;
-
 use super::{
-    ByteReader, ByteWriter, Deserializable, DeserializationError, Digest, Hasher, NoteInputs,
-    NoteScript, Serializable, Word,
+    ByteReader,
+    ByteWriter,
+    Deserializable,
+    DeserializationError,
+    Hasher,
+    NoteInputs,
+    NoteScript,
+    Serializable,
+    Word,
 };
 
 /// Value that describes under which condition a note can be consumed.
@@ -23,7 +27,7 @@ pub struct NoteRecipient {
     serial_num: Word,
     script: NoteScript,
     inputs: NoteInputs,
-    digest: Digest,
+    digest: Word,
 }
 
 impl NoteRecipient {
@@ -53,31 +57,13 @@ impl NoteRecipient {
     /// The recipient's digest, which commits to its details.
     ///
     /// This is the public data required to create a note.
-    pub fn digest(&self) -> Digest {
+    pub fn digest(&self) -> Word {
         self.digest
-    }
-
-    /// Returns the recipient formatted to be used with the advice map.
-    ///
-    /// The format is `inputs_length || INPUTS_COMMITMENT || SCRIPT_ROOT || SERIAL_NUMBER`
-    ///
-    /// Where:
-    /// - inputs_length is the length of the note inputs
-    /// - INPUTS_COMMITMENT is the commitment of the note inputs
-    /// - SCRIPT_ROOT is the commitment of the note script (i.e., the script's MAST root)
-    /// - SERIAL_NUMBER is the recipient's serial number
-    pub fn format_for_advice(&self) -> Vec<Felt> {
-        let mut result = Vec::with_capacity(13);
-        result.push(self.inputs.num_values().into());
-        result.extend(self.inputs.commitment());
-        result.extend(self.script.root());
-        result.extend(self.serial_num);
-        result
     }
 }
 
-fn compute_recipient_digest(serial_num: Word, script: &NoteScript, inputs: &NoteInputs) -> Digest {
-    let serial_num_hash = Hasher::merge(&[serial_num.into(), Digest::default()]);
+fn compute_recipient_digest(serial_num: Word, script: &NoteScript, inputs: &NoteInputs) -> Word {
+    let serial_num_hash = Hasher::merge(&[serial_num, Word::empty()]);
     let merge_script = Hasher::merge(&[serial_num_hash, script.root()]);
     Hasher::merge(&[merge_script, inputs.commitment()])
 }

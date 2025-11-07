@@ -1,119 +1,125 @@
-use alloc::{boxed::Box, collections::BTreeSet, rc::Rc, sync::Arc};
+use alloc::collections::BTreeSet;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
-use miden_lib::transaction::{TransactionAdviceInputs, TransactionEvent, TransactionEventError};
-use miden_objects::{
-    Digest,
-    account::{AccountHeader, AccountVaultDelta},
-    assembly::mast::MastNodeExt,
+use miden_lib::StdLibrary;
+use miden_lib::transaction::{EventId, TransactionEvent};
+use miden_objects::Word;
+use miden_processor::{
+    AdviceMutation,
+    AsyncHost,
+    BaseHost,
+    EventError,
+    FutureMaybeSend,
+    MastForest,
+    ProcessState,
 };
-use miden_tx::{
-    TransactionMastStore,
-    host::{AccountProcedureIndexMap, LinkMap},
-};
-use vm_processor::{
-    AdviceProvider, AdviceSource, ContextId, ErrorContext, ExecutionError, Host, MastForest,
-    MastForestStore, MemAdviceProvider, ProcessState,
-};
+use miden_tx::TransactionExecutorHost;
+use miden_tx::auth::UnreachableAuth;
+
+use crate::TransactionContext;
 
 // MOCK HOST
 // ================================================================================================
 
-/// This is very similar to the TransactionHost in miden-tx. The differences include:
-/// - We do not track account delta here.
-/// - There is special handling of EMPTY_DIGEST in account procedure index map.
-/// - This host uses `MemAdviceProvider` which is instantiated from the passed in advice inputs.
-pub struct MockHost {
-    adv_provider: MemAdviceProvider,
-    acct_procedure_index_map: AccountProcedureIndexMap,
-    mast_store: Rc<TransactionMastStore>,
+/// The [`MockHost`] wraps a [`TransactionExecutorHost`] and forwards event handling requests to it,
+/// with the difference that it only handles a subset of the events that the executor host handles.
+///
+/// Why don't we always forward requests to the executor host? In some tests, when using
+/// [`TransactionContext::execute_code`], we want to test that the transaction kernel fails
+/// with a certain error when given invalid inputs, but the event handler in the executor host would
+/// prematurely abort the transaction due to the invalid inputs. To avoid this situation, the event
+/// handler can be disabled and we can test that the transaction kernel has the expected behavior
+/// (e.g. even if the transaction host was malicious).
+///
+/// Some event handlers, such as delta or output note tracking, will similarly interfere with
+/// testing a procedure in isolation and these are also turned off in this host.
+pub(crate) struct MockHost<'store> {
+    /// The underlying [`TransactionExecutorHost`] that the mock host will forward requests to.
+    exec_host: TransactionExecutorHost<'store, 'static, TransactionContext, UnreachableAuth>,
+
+    /// The set of event IDs that the mock host will forward to the [`TransactionExecutorHost`].
+    ///
+    /// Event IDs that are not in this set are not handled. This can be useful in certain test
+    /// scenarios.
+    handled_events: BTreeSet<EventId>,
 }
 
-impl MockHost {
-    /// Returns a new [MockHost] instance with the provided
-    /// [AdviceInputs](vm_processor::AdviceInputs).
+impl<'store> MockHost<'store> {
+    /// Returns a new [`MockHost`] instance with the provided inputs.
     pub fn new(
-        account: AccountHeader,
-        advice_inputs: TransactionAdviceInputs,
-        mast_store: Rc<TransactionMastStore>,
-        mut foreign_code_commitments: BTreeSet<Digest>,
+        exec_host: TransactionExecutorHost<'store, 'static, TransactionContext, UnreachableAuth>,
     ) -> Self {
-        foreign_code_commitments.insert(account.code_commitment());
-        let adv_provider = MemAdviceProvider::from(advice_inputs.into_inner());
-        let proc_index_map = AccountProcedureIndexMap::new(foreign_code_commitments, &adv_provider);
+        // StdLibrary events are always handled.
+        let stdlib_handlers = StdLibrary::default()
+            .handlers()
+            .into_iter()
+            .map(|(handler_event_name, _)| handler_event_name.to_event_id());
+        let mut handled_events = BTreeSet::from_iter(stdlib_handlers);
 
-        Self {
-            adv_provider,
-            acct_procedure_index_map: proc_index_map.unwrap(),
-            mast_store,
-        }
+        // The default set of transaction events that are always handled.
+        handled_events.extend(
+            [
+                &TransactionEvent::AccountPushProcedureIndex,
+                &TransactionEvent::LinkMapSet,
+                &TransactionEvent::LinkMapGet,
+                // TODO: It should be possible to remove this after implementing
+                // https://github.com/0xMiden/miden-base/issues/1852.
+                &TransactionEvent::EpilogueBeforeTxFeeRemovedFromAccount,
+            ]
+            .map(TransactionEvent::event_id),
+        );
+
+        Self { exec_host, handled_events }
     }
 
-    /// Consumes `self` and returns the advice provider and account vault delta.
-    pub fn into_parts(self) -> (MemAdviceProvider, AccountVaultDelta) {
-        (self.adv_provider, AccountVaultDelta::default())
-    }
-
-    // EVENT HANDLERS
-    // --------------------------------------------------------------------------------------------
-
-    fn on_push_account_procedure_index(
-        &mut self,
-        process: ProcessState,
-        err_ctx: &ErrorContext<'_, impl MastNodeExt>,
-    ) -> Result<(), ExecutionError> {
-        let proc_idx = self
-            .acct_procedure_index_map
-            .get_proc_index(&process)
-            .map_err(|err| ExecutionError::event_error(Box::new(err), err_ctx))?;
-        self.adv_provider.push_stack(AdviceSource::Value(proc_idx.into()), err_ctx)?;
-        Ok(())
+    // Adds the transaction events needed for Lazy loading to the set of handled events.
+    pub fn enable_lazy_loading(&mut self) {
+        self.handled_events.extend(
+            [
+                &TransactionEvent::AccountBeforeForeignLoad,
+                &TransactionEvent::AccountVaultBeforeGetBalance,
+                &TransactionEvent::AccountVaultBeforeHasNonFungibleAsset,
+                &TransactionEvent::AccountVaultBeforeAddAsset,
+                &TransactionEvent::AccountVaultBeforeRemoveAsset,
+                &TransactionEvent::AccountStorageBeforeSetMapItem,
+                &TransactionEvent::AccountStorageBeforeGetMapItem,
+            ]
+            .map(TransactionEvent::event_id),
+        );
     }
 }
 
-impl Host for MockHost {
-    type AdviceProvider = MemAdviceProvider;
-
-    fn advice_provider(&self) -> &Self::AdviceProvider {
-        &self.adv_provider
+impl<'store> BaseHost for MockHost<'store> {
+    fn get_label_and_source_file(
+        &self,
+        location: &miden_objects::assembly::debuginfo::Location,
+    ) -> (
+        miden_objects::assembly::debuginfo::SourceSpan,
+        Option<Arc<miden_objects::assembly::SourceFile>>,
+    ) {
+        self.exec_host.get_label_and_source_file(location)
     }
+}
 
-    fn advice_provider_mut(&mut self) -> &mut Self::AdviceProvider {
-        &mut self.adv_provider
-    }
-
-    fn get_mast_forest(&self, node_digest: &Digest) -> Option<Arc<MastForest>> {
-        self.mast_store.get(node_digest)
+impl<'store> AsyncHost for MockHost<'store> {
+    fn get_mast_forest(&self, node_digest: &Word) -> impl FutureMaybeSend<Option<Arc<MastForest>>> {
+        self.exec_host.get_mast_forest(node_digest)
     }
 
     fn on_event(
         &mut self,
-        process: ProcessState,
-        event_id: u32,
-        err_ctx: &ErrorContext<'_, impl MastNodeExt>,
-    ) -> Result<(), ExecutionError> {
-        let event = TransactionEvent::try_from(event_id)
-            .map_err(|err| ExecutionError::event_error(Box::new(err), err_ctx))?;
+        process: &ProcessState,
+    ) -> impl FutureMaybeSend<Result<Vec<AdviceMutation>, EventError>> {
+        let event_id = EventId::from_felt(process.get_stack_item(0));
 
-        if process.ctx() != ContextId::root() {
-            return Err(ExecutionError::event_error(
-                Box::new(TransactionEventError::NotRootContext(event_id)),
-                err_ctx,
-            ));
+        async move {
+            // If the host should handle the event, delegate to the tx executor host.
+            if self.handled_events.contains(&event_id) {
+                self.exec_host.on_event(process).await
+            } else {
+                Ok(Vec::new())
+            }
         }
-
-        match event {
-            TransactionEvent::AccountPushProcedureIndex => {
-                self.on_push_account_procedure_index(process, err_ctx)
-            },
-            TransactionEvent::LinkMapSetEvent => {
-                LinkMap::handle_set_event(process, err_ctx, self.advice_provider_mut())
-            },
-            TransactionEvent::LinkMapGetEvent => {
-                LinkMap::handle_get_event(process, err_ctx, self.advice_provider_mut())
-            },
-            _ => Ok(()),
-        }?;
-
-        Ok(())
     }
 }

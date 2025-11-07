@@ -1,11 +1,9 @@
-use crate::{
-    Digest,
-    account::{AccountCode, AccountId, PartialAccount, PartialStorage},
-    asset::PartialVault,
-    block::AccountWitness,
-    crypto::merkle::{SmtProof, SmtProofError},
-    utils::{ByteReader, ByteWriter, Deserializable, DeserializationError, Serializable},
-};
+use crate::Word;
+use crate::account::{AccountCode, AccountId, PartialAccount, PartialStorage};
+use crate::asset::PartialVault;
+use crate::block::AccountWitness;
+use crate::crypto::merkle::{SmtProof, SmtProofError};
+use crate::utils::{ByteReader, ByteWriter, Deserializable, DeserializationError, Serializable};
 
 // ACCOUNT INPUTS
 // ================================================================================================
@@ -66,7 +64,7 @@ impl AccountInputs {
 
     /// Computes the account root based on the account witness.
     /// This root should be equal to the account root in the reference block header.
-    pub fn compute_account_root(&self) -> Result<Digest, SmtProofError> {
+    pub fn compute_account_root(&self) -> Result<Word, SmtProofError> {
         let smt_merkle_path = self.witness.path().clone();
         let smt_leaf = self.witness.leaf();
         let root = SmtProof::new(smt_merkle_path, smt_leaf)?.compute_root();
@@ -98,20 +96,16 @@ impl Deserializable for AccountInputs {
 mod tests {
     use alloc::vec::Vec;
 
-    use miden_crypto::merkle::MerklePath;
-    use vm_core::{
-        Felt,
-        utils::{Deserializable, Serializable},
-    };
-    use vm_processor::SMT_DEPTH;
+    use miden_core::Felt;
+    use miden_core::utils::{Deserializable, Serializable};
+    use miden_crypto::merkle::SparseMerklePath;
+    use miden_processor::SMT_DEPTH;
 
-    use crate::{
-        account::{Account, AccountCode, AccountId, AccountStorage},
-        asset::AssetVault,
-        block::AccountWitness,
-        testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
-        transaction::AccountInputs,
-    };
+    use crate::account::{Account, AccountCode, AccountId, AccountStorage, PartialAccount};
+    use crate::asset::AssetVault;
+    use crate::block::AccountWitness;
+    use crate::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE;
+    use crate::transaction::AccountInputs;
 
     #[test]
     fn serde_roundtrip() {
@@ -119,7 +113,7 @@ mod tests {
         let code = AccountCode::mock();
         let vault = AssetVault::new(&[]).unwrap();
         let storage = AccountStorage::new(vec![]).unwrap();
-        let account = Account::from_parts(id, vault, storage, code, Felt::new(10));
+        let account = Account::new_existing(id, vault, storage, code, Felt::new(10));
 
         let commitment = account.commitment();
 
@@ -127,10 +121,11 @@ mod tests {
         for _ in 0..(SMT_DEPTH as usize) {
             merkle_nodes.push(commitment);
         }
-        let merkle_path = MerklePath::new(merkle_nodes);
+        let merkle_path = SparseMerklePath::from_sized_iter(merkle_nodes)
+            .expect("The nodes given are of SMT_DEPTH count");
 
         let fpi_inputs = AccountInputs::new(
-            account.into(),
+            PartialAccount::from(&account),
             AccountWitness::new(id, commitment, merkle_path).unwrap(),
         );
 

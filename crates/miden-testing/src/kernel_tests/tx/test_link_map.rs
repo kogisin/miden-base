@@ -1,38 +1,38 @@
 use alloc::vec::Vec;
-use core::cmp::Ordering;
-use std::{collections::BTreeMap, string::String};
+use std::collections::BTreeMap;
+use std::string::String;
 
 use anyhow::Context;
-use miden_objects::{Digest, EMPTY_WORD, Word, account::delta::LexicographicWord};
-use miden_tx::{host::LinkMap, utils::word_to_masm_push_string};
+use miden_objects::{EMPTY_WORD, LexicographicWord, Word};
+use miden_processor::{ONE, ZERO};
+use miden_tx::{LinkMap, MemoryViewer};
 use rand::seq::IteratorRandom;
-use vm_processor::{MemAdviceProvider, ONE, ProcessState, ZERO};
-use winter_rand_utils::rand_array;
+use winter_rand_utils::rand_value;
 
-use crate::{TransactionContextBuilder, executor::CodeExecutor};
+use crate::TransactionContextBuilder;
 
 /// Tests the following properties:
 /// - Insertion into an empty map.
 /// - Insertion after an existing entry.
 /// - Insertion in between two existing entries.
 /// - Insertion before an existing head.
-#[test]
-fn insertion() -> anyhow::Result<()> {
+#[tokio::test]
+async fn insertion() -> anyhow::Result<()> {
     let map_ptr = 8u32;
     // check that using an empty word as key is fine
-    let entry0_key = Digest::from([0, 0, 0, 0u32]);
-    let entry0_value = Digest::from([1, 2, 3, 4u32]);
-    let entry1_key = Digest::from([1, 2, 1, 1u32]);
-    let entry1_value = Digest::from([3, 4, 5, 6u32]);
-    let entry2_key = Digest::from([1, 3, 1, 1u32]);
+    let entry0_key = Word::from([0, 0, 0, 0u32]);
+    let entry0_value = Word::from([1, 2, 3, 4u32]);
+    let entry1_key = Word::from([1, 2, 1, 1u32]);
+    let entry1_value = Word::from([3, 4, 5, 6u32]);
+    let entry2_key = Word::from([1, 3, 1, 1u32]);
     // check that using an empty word as value is fine
-    let entry2_value = Digest::from([0, 0, 0, 0u32]);
-    let entry3_key = Digest::from([1, 4, 1, 1u32]);
-    let entry3_value = Digest::from([5, 6, 7, 8u32]);
+    let entry2_value = Word::from([0, 0, 0, 0u32]);
+    let entry3_key = Word::from([1, 4, 1, 1u32]);
+    let entry3_value = Word::from([5, 6, 7, 8u32]);
 
     let code = format!(
         r#"
-      use.kernel::link_map
+      use.$kernel::link_map
 
       const.MAP_PTR={map_ptr}
 
@@ -169,22 +169,14 @@ fn insertion() -> anyhow::Result<()> {
           assert_eqw.err="retrieved value1 for key {entry3_key} should be an empty word"
           # => []
       end
-    "#,
-        entry0_key = word_to_masm_push_string(&entry0_key),
-        entry0_value = word_to_masm_push_string(&entry0_value),
-        entry1_key = word_to_masm_push_string(&entry1_key),
-        entry1_value = word_to_masm_push_string(&entry1_value),
-        entry2_key = word_to_masm_push_string(&entry2_key),
-        entry2_value = word_to_masm_push_string(&entry2_value),
-        entry3_key = word_to_masm_push_string(&entry3_key),
-        entry3_value = word_to_masm_push_string(&entry3_value),
+    "#
     );
 
     let tx_context = TransactionContextBuilder::with_existing_mock_account().build()?;
-    let process = tx_context.execute_code(&code).context("failed to execute code")?;
-    let state = ProcessState::from(&process);
+    let exec_output = tx_context.execute_code(&code).await.context("failed to execute code")?;
+    let mem_viewer = MemoryViewer::ExecutionOutputs(&exec_output);
 
-    let map = LinkMap::new(map_ptr.into(), state);
+    let map = LinkMap::new(map_ptr.into(), &mem_viewer);
     let mut map_iter = map.iter();
 
     let entry0 = map_iter.next().expect("map should have four entries");
@@ -196,41 +188,41 @@ fn insertion() -> anyhow::Result<()> {
     assert_eq!(entry0.metadata.map_ptr, map_ptr);
     assert_eq!(entry0.metadata.prev_entry_ptr, 0);
     assert_eq!(entry0.metadata.next_entry_ptr, entry1.ptr);
-    assert_eq!(Word::from(entry0.key), *entry0_key);
-    assert_eq!(entry0.value0, *entry0_value);
+    assert_eq!(Word::from(entry0.key), entry0_key);
+    assert_eq!(entry0.value0, entry0_value);
     assert_eq!(entry0.value1, EMPTY_WORD);
 
     assert_eq!(entry1.metadata.map_ptr, map_ptr);
     assert_eq!(entry1.metadata.prev_entry_ptr, entry0.ptr);
     assert_eq!(entry1.metadata.next_entry_ptr, entry2.ptr);
-    assert_eq!(Word::from(entry1.key), *entry1_key);
-    assert_eq!(entry1.value0, *entry1_value);
+    assert_eq!(Word::from(entry1.key), entry1_key);
+    assert_eq!(entry1.value0, entry1_value);
     assert_eq!(entry1.value1, EMPTY_WORD);
 
     assert_eq!(entry2.metadata.map_ptr, map_ptr);
     assert_eq!(entry2.metadata.prev_entry_ptr, entry1.ptr);
     assert_eq!(entry2.metadata.next_entry_ptr, entry3.ptr);
-    assert_eq!(Word::from(entry2.key), *entry2_key);
-    assert_eq!(entry2.value0, *entry2_value);
+    assert_eq!(Word::from(entry2.key), entry2_key);
+    assert_eq!(entry2.value0, entry2_value);
     assert_eq!(entry2.value1, EMPTY_WORD);
 
     assert_eq!(entry3.metadata.map_ptr, map_ptr);
     assert_eq!(entry3.metadata.prev_entry_ptr, entry2.ptr);
     assert_eq!(entry3.metadata.next_entry_ptr, 0);
-    assert_eq!(Word::from(entry3.key), *entry3_key);
-    assert_eq!(entry3.value0, *entry3_value);
+    assert_eq!(Word::from(entry3.key), entry3_key);
+    assert_eq!(entry3.value0, entry3_value);
     assert_eq!(entry3.value1, EMPTY_WORD);
 
     Ok(())
 }
 
-#[test]
-fn insert_and_update() -> anyhow::Result<()> {
+#[tokio::test]
+async fn insert_and_update() -> anyhow::Result<()> {
     const MAP_PTR: u32 = 8;
 
-    let value0 = digest([1, 2, 3, 4]);
-    let value1 = digest([2, 3, 4, 5]);
-    let value2 = digest([3, 4, 5, 6]);
+    let value0 = Word::from([1, 2, 3, 4u32]);
+    let value1 = Word::from([2, 3, 4, 5u32]);
+    let value2 = Word::from([3, 4, 5, 6u32]);
 
     let operations = vec![
         TestOperation::set(MAP_PTR, link_map_key([1, 0, 0, 0]), (value0, value1)),
@@ -242,19 +234,19 @@ fn insert_and_update() -> anyhow::Result<()> {
         TestOperation::set(MAP_PTR, link_map_key([3, 0, 0, 0]), (value1, value2)),
     ];
 
-    execute_link_map_test(operations)
+    execute_link_map_test(operations).await
 }
 
-#[test]
-fn insert_at_head() -> anyhow::Result<()> {
+#[tokio::test]
+async fn insert_at_head() -> anyhow::Result<()> {
     const MAP_PTR: u32 = 8;
 
     let key3 = link_map_key([3, 0, 0, 0]);
     let key2 = link_map_key([2, 0, 0, 0]);
     let key1 = link_map_key([1, 0, 0, 0]);
-    let value0 = digest([1, 2, 3, 4]);
-    let value1 = digest([2, 3, 4, 5]);
-    let value2 = digest([3, 4, 5, 6]);
+    let value0 = Word::from([1, 2, 3, 4u32]);
+    let value1 = Word::from([2, 3, 4, 5u32]);
+    let value2 = Word::from([3, 4, 5, 6u32]);
 
     let operations = vec![
         TestOperation::set(MAP_PTR, key3, (value1, value0)),
@@ -266,17 +258,17 @@ fn insert_at_head() -> anyhow::Result<()> {
         TestOperation::get(MAP_PTR, key3),
     ];
 
-    execute_link_map_test(operations)
+    execute_link_map_test(operations).await
 }
 
 /// Tests that a get before a set results in the expected returned values and behavior.
-#[test]
-fn get_before_set() -> anyhow::Result<()> {
+#[tokio::test]
+async fn get_before_set() -> anyhow::Result<()> {
     const MAP_PTR: u32 = 8;
 
     let key0 = link_map_key([3, 0, 0, 0]);
-    let value0 = digest([1, 2, 3, 4]);
-    let value1 = digest([2, 3, 4, 5]);
+    let value0 = Word::from([1, 2, 3, 4u32]);
+    let value1 = Word::from([2, 3, 4, 5u32]);
 
     let operations = vec![
         TestOperation::get(MAP_PTR, key0),
@@ -284,20 +276,20 @@ fn get_before_set() -> anyhow::Result<()> {
         TestOperation::get(MAP_PTR, key0),
     ];
 
-    execute_link_map_test(operations)
+    execute_link_map_test(operations).await
 }
 
-#[test]
-fn multiple_link_maps() -> anyhow::Result<()> {
+#[tokio::test]
+async fn multiple_link_maps() -> anyhow::Result<()> {
     const MAP_PTR0: u32 = 8;
     const MAP_PTR1: u32 = 12;
 
     let key3 = link_map_key([3, 0, 0, 0]);
     let key2 = link_map_key([2, 0, 0, 0]);
     let key1 = link_map_key([1, 0, 0, 0]);
-    let value0 = digest([1, 2, 3, 4]);
-    let value1 = digest([2, 3, 4, 5]);
-    let value2 = digest([3, 4, 5, 6]);
+    let value0 = Word::from([1, 2, 3, 4u32]);
+    let value1 = Word::from([2, 3, 4, 5u32]);
+    let value2 = Word::from([3, 4, 5, 6u32]);
 
     let operations = vec![
         TestOperation::set(MAP_PTR0, key3, (value0, value2)),
@@ -313,11 +305,11 @@ fn multiple_link_maps() -> anyhow::Result<()> {
         TestOperation::get(MAP_PTR1, key3),
     ];
 
-    execute_link_map_test(operations)
+    execute_link_map_test(operations).await
 }
 
-#[test]
-fn iteration() -> anyhow::Result<()> {
+#[tokio::test]
+async fn iteration() -> anyhow::Result<()> {
     const MAP_PTR: u32 = 12;
 
     let entries = generate_entries(100);
@@ -332,11 +324,11 @@ fn iteration() -> anyhow::Result<()> {
     // Iterate the map.
     test_operations.push(TestOperation::iter(MAP_PTR));
 
-    execute_link_map_test(test_operations)
+    execute_link_map_test(test_operations).await
 }
 
-#[test]
-fn set_update_get_random_entries() -> anyhow::Result<()> {
+#[tokio::test]
+async fn set_update_get_random_entries() -> anyhow::Result<()> {
     const MAP_PTR: u32 = 12;
 
     let entries = generate_entries(1000);
@@ -364,89 +356,22 @@ fn set_update_get_random_entries() -> anyhow::Result<()> {
     test_operations.extend(get_ops2);
     test_operations.extend(get_ops3);
 
-    execute_link_map_test(test_operations)
-}
-
-// COMPARISON OPERATIONS TESTS
-// ================================================================================================
-
-#[test]
-fn is_key_greater() -> anyhow::Result<()> {
-    execute_comparison_test(Ordering::Greater)
-}
-
-#[test]
-fn is_key_less() -> anyhow::Result<()> {
-    execute_comparison_test(Ordering::Less)
-}
-
-fn execute_comparison_test(operation: Ordering) -> anyhow::Result<()> {
-    let procedure_name = match operation {
-        Ordering::Less => "is_key_less",
-        Ordering::Equal => anyhow::bail!("unsupported ordering operation for testing"),
-        Ordering::Greater => "is_key_greater",
-    };
-
-    let mut test_code = String::new();
-
-    for _ in 0..1000 {
-        let key0 = Word::from(rand_array());
-        let key1 = Word::from(rand_array());
-
-        let cmp = LexicographicWord::from(key0).cmp(&LexicographicWord::from(key1));
-        let expected = cmp == operation;
-
-        let code = format!(
-            r#"
-        push.{KEY_1}
-        push.{KEY_0}
-        exec.link_map::{proc_name}
-        push.{expected_value}
-        assert_eq.err="failed for procedure {proc_name} with keys {key0:?}, {key1:?}"
-      "#,
-            KEY_0 = word_to_masm_push_string(&key0),
-            KEY_1 = word_to_masm_push_string(&key1),
-            proc_name = procedure_name,
-            expected_value = expected as u8
-        );
-
-        test_code.push_str(&code);
-    }
-
-    let code = format!(
-        r#"
-        use.kernel::link_map
-
-        begin
-          {test_code}
-        end
-        "#,
-    );
-
-    CodeExecutor::with_advice_provider(MemAdviceProvider::default())
-        .run(&code)
-        .with_context(|| format!("comparison test for {procedure_name} failed"))?;
-
-    Ok(())
+    execute_link_map_test(test_operations).await
 }
 
 // TEST HELPERS
 // ================================================================================================
 
-fn digest(elements: [u32; 4]) -> Digest {
-    Digest::from(elements)
-}
-
 fn link_map_key(elements: [u32; 4]) -> LexicographicWord {
-    LexicographicWord::from(Word::from(Digest::from(elements)))
+    LexicographicWord::from(Word::from(elements))
 }
 
 enum TestOperation {
     Set {
         map_ptr: u32,
         key: LexicographicWord,
-        value0: Digest,
-        value1: Digest,
+        value0: Word,
+        value1: Word,
     },
     Get {
         map_ptr: u32,
@@ -458,7 +383,7 @@ enum TestOperation {
 }
 
 impl TestOperation {
-    pub fn set(map_ptr: u32, key: LexicographicWord, values: (Digest, Digest)) -> Self {
+    pub fn set(map_ptr: u32, key: LexicographicWord, values: (Word, Word)) -> Self {
         Self::Set {
             map_ptr,
             key,
@@ -474,9 +399,9 @@ impl TestOperation {
     }
 }
 
-fn execute_link_map_test(operations: Vec<TestOperation>) -> anyhow::Result<()> {
+async fn execute_link_map_test(operations: Vec<TestOperation>) -> anyhow::Result<()> {
     let mut test_code = String::new();
-    let mut control_maps: BTreeMap<u32, BTreeMap<LexicographicWord, (Digest, Digest)>> =
+    let mut control_maps: BTreeMap<u32, BTreeMap<LexicographicWord, (Word, Word)>> =
         BTreeMap::new();
 
     for operation in operations {
@@ -487,16 +412,16 @@ fn execute_link_map_test(operations: Vec<TestOperation>) -> anyhow::Result<()> {
 
                 let set_code = format!(
                     r#"
-                  push.{value1}.{value0}.{key}.{map_ptr}
+                  push.{value1} push.{value0} push.{key} push.{map_ptr}
                   # => [map_ptr, KEY, VALUE]
                   exec.link_map::set
                   # => [is_new_key]
                   push.{expected_is_new_key}
                   assert_eq.err="is_new_key returned by link_map::set for {key} did not match expected value {expected_is_new_key}"
                 "#,
-                    key = word_to_masm_push_string(&Word::from(key)),
-                    value0 = word_to_masm_push_string(&value0),
-                    value1 = word_to_masm_push_string(&value1),
+                    key = Word::from(key),
+                    value0 = value0,
+                    value1 = value1,
                     expected_is_new_key = is_new_key as u8,
                 );
 
@@ -509,12 +434,12 @@ fn execute_link_map_test(operations: Vec<TestOperation>) -> anyhow::Result<()> {
                 let (expected_contains_key, (expected_value0, expected_value1)) =
                     match control_value {
                         Some(value) => (true, (value.0, value.1)),
-                        None => (false, (Digest::from(EMPTY_WORD), Digest::from(EMPTY_WORD))),
+                        None => (false, (Word::empty(), Word::empty())),
                     };
 
                 let get_code = format!(
                     r#"
-                  push.{key}.{map_ptr}
+                  push.{key} push.{map_ptr}
                   # => [map_ptr, KEY]
                   exec.link_map::get
                   # => [contains_key, VALUE0, VALUE1]
@@ -525,9 +450,9 @@ fn execute_link_map_test(operations: Vec<TestOperation>) -> anyhow::Result<()> {
                   push.{expected_value1}
                   assert_eqw.err="value1 returned from get is not the expected value: {expected_value1}"
                 "#,
-                    key = word_to_masm_push_string(&Word::from(key)),
-                    expected_value0 = word_to_masm_push_string(&expected_value0),
-                    expected_value1 = word_to_masm_push_string(&expected_value1),
+                    key = Word::from(key),
+                    expected_value0 = expected_value0,
+                    expected_value1 = expected_value1,
                     expected_contains_key = expected_contains_key as u8
                 );
 
@@ -592,9 +517,9 @@ fn execute_link_map_test(operations: Vec<TestOperation>) -> anyhow::Result<()> {
 
                       # => [next_iter]
                   "#,
-                        control_key = word_to_masm_push_string(&Word::from(*control_key)),
-                        control_value0 = word_to_masm_push_string(control_value0),
-                        control_value1 = word_to_masm_push_string(control_value1),
+                        control_key = Word::from(*control_key),
+                        control_value0 = *control_value0,
+                        control_value1 = *control_value1,
                         control_has_next = if control_iter.peek().is_some() { ONE } else { ZERO },
                     ));
                 }
@@ -609,7 +534,7 @@ fn execute_link_map_test(operations: Vec<TestOperation>) -> anyhow::Result<()> {
 
     let code = format!(
         r#"
-      use.kernel::link_map
+      use.$kernel::link_map
       begin
           {test_code}
       end
@@ -617,11 +542,11 @@ fn execute_link_map_test(operations: Vec<TestOperation>) -> anyhow::Result<()> {
     );
 
     let tx_context = TransactionContextBuilder::with_existing_mock_account().build()?;
-    let process = tx_context.execute_code(&code).context("failed to execute code")?;
-    let state = ProcessState::from(&process);
+    let exec_output = tx_context.execute_code(&code).await.context("failed to execute code")?;
+    let mem_viewer = MemoryViewer::ExecutionOutputs(&exec_output);
 
     for (map_ptr, control_map) in control_maps {
-        let map = LinkMap::new(map_ptr.into(), state);
+        let map = LinkMap::new(map_ptr.into(), &mem_viewer);
         let actual_map_len = map.iter().count();
         assert_eq!(
             actual_map_len,
@@ -635,13 +560,10 @@ fn execute_link_map_test(operations: Vec<TestOperation>) -> anyhow::Result<()> {
                 (control_key, (control_value0, control_value1)),
                 (actual_key, (actual_value0, actual_value1)),
             ),
-        ) in
-            control_map
-                .iter()
-                .zip(map.iter().map(|entry| {
-                    (entry.key, (Digest::from(entry.value0), Digest::from(entry.value1)))
-                }))
-                .enumerate()
+        ) in control_map
+            .iter()
+            .zip(map.iter().map(|entry| (entry.key, (entry.value0, entry.value1))))
+            .enumerate()
         {
             assert_eq!(
                 actual_key, *control_key,
@@ -663,7 +585,7 @@ fn execute_link_map_test(operations: Vec<TestOperation>) -> anyhow::Result<()> {
 
 fn generate_set_ops(
     map_ptr: u32,
-    entries: &[(LexicographicWord, (Digest, Digest))],
+    entries: &[(LexicographicWord, (Word, Word))],
 ) -> Vec<TestOperation> {
     entries
         .iter()
@@ -673,40 +595,36 @@ fn generate_set_ops(
 
 fn generate_get_ops(
     map_ptr: u32,
-    entries: &[(LexicographicWord, (Digest, Digest))],
+    entries: &[(LexicographicWord, (Word, Word))],
 ) -> Vec<TestOperation> {
     entries.iter().map(|(key, _)| TestOperation::get(map_ptr, *key)).collect()
 }
 
-fn generate_entries(count: u64) -> Vec<(LexicographicWord, (Digest, Digest))> {
+fn generate_entries(count: u64) -> Vec<(LexicographicWord, (Word, Word))> {
     (0..count)
         .map(|_| {
             let key = rand_link_map_key();
-            let value0 = rand_digest();
-            let value1 = rand_digest();
+            let value0 = rand_value::<Word>();
+            let value1 = rand_value::<Word>();
             (key, (value0, value1))
         })
         .collect()
 }
 
 fn generate_updates(
-    entries: &[(LexicographicWord, (Digest, Digest))],
+    entries: &[(LexicographicWord, (Word, Word))],
     num_updates: usize,
-) -> Vec<(LexicographicWord, (Digest, Digest))> {
+) -> Vec<(LexicographicWord, (Word, Word))> {
     let mut rng = rand::rng();
 
     entries
         .iter()
         .choose_multiple(&mut rng, num_updates)
         .into_iter()
-        .map(|(key, _)| (*key, (rand_digest(), rand_digest())))
+        .map(|(key, _)| (*key, (rand_value::<Word>(), rand_value::<Word>())))
         .collect()
 }
 
-fn rand_digest() -> Digest {
-    Digest::new(rand_array())
-}
-
 fn rand_link_map_key() -> LexicographicWord {
-    LexicographicWord::from(rand_array())
+    LexicographicWord::new(rand_value())
 }

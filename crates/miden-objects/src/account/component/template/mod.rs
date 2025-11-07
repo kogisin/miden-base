@@ -1,14 +1,12 @@
-use alloc::{
-    collections::{BTreeMap, BTreeSet},
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use core::str::FromStr;
 
-use assembly::Library;
+use miden_assembly::Library;
+use miden_core::utils::{ByteReader, ByteWriter, Deserializable, Serializable};
+use miden_processor::DeserializationError;
 use semver::Version;
-use vm_core::utils::{ByteReader, ByteWriter, Deserializable, Serializable};
-use vm_processor::DeserializationError;
 
 use super::AccountType;
 use crate::errors::AccountComponentTemplateError;
@@ -62,16 +60,16 @@ impl AccountComponentTemplate {
 }
 
 impl Serializable for AccountComponentTemplate {
-    fn write_into<W: vm_core::utils::ByteWriter>(&self, target: &mut W) {
+    fn write_into<W: miden_core::utils::ByteWriter>(&self, target: &mut W) {
         target.write(&self.metadata);
         target.write(&self.library);
     }
 }
 
 impl Deserializable for AccountComponentTemplate {
-    fn read_from<R: vm_core::utils::ByteReader>(
+    fn read_from<R: miden_core::utils::ByteReader>(
         source: &mut R,
-    ) -> Result<Self, vm_processor::DeserializationError> {
+    ) -> Result<Self, miden_processor::DeserializationError> {
         // Read and deserialize the configuration from a TOML string.
         let metadata: AccountComponentMetadata = source.read()?;
         let library = Library::read_from(source)?;
@@ -106,7 +104,7 @@ impl Deserializable for AccountComponentTemplate {
 ///
 /// ```
 /// # use semver::Version;
-/// # use std::collections::BTreeSet;
+/// # use std::collections::{BTreeMap, BTreeSet};
 /// # use miden_objects::{testing::account_code::CODE, account::{
 /// #     AccountComponent, AccountComponentMetadata, StorageEntry,
 /// #     StorageValueName,
@@ -128,8 +126,10 @@ impl Deserializable for AccountComponentTemplate {
 /// .with_description("this is the first entry in the storage layout");
 /// let storage_entry = StorageEntry::new_value(0, word_representation);
 ///
-/// let init_storage_data =
-///     InitStorageData::new([(StorageValueName::new("test_value.foo")?, "300".to_string())]);
+/// let init_storage_data = InitStorageData::new(
+///     [(StorageValueName::new("test_value.foo")?, "300".to_string())],
+///     BTreeMap::new(),
+/// );
 ///
 /// let component_template = AccountComponentMetadata::new(
 ///     "test name".into(),
@@ -255,12 +255,10 @@ impl AccountComponentMetadata {
 
         // Check that slots start at 0 and are contiguous
         all_slots.sort_unstable();
-        if let Some(&first_slot) = all_slots.first() {
-            if first_slot != 0 {
-                return Err(AccountComponentTemplateError::StorageSlotsDoNotStartAtZero(
-                    first_slot,
-                ));
-            }
+        if let Some(&first_slot) = all_slots.first()
+            && first_slot != 0
+        {
+            return Err(AccountComponentTemplateError::StorageSlotsDoNotStartAtZero(first_slot));
         }
 
         for slots in all_slots.windows(2) {
@@ -331,32 +329,27 @@ impl Deserializable for AccountComponentMetadata {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, string::ToString};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::string::ToString;
 
-    use assembly::Assembler;
     use assert_matches::assert_matches;
+    use miden_assembly::Assembler;
+    use miden_core::utils::{Deserializable, Serializable};
+    use miden_core::{Felt, FieldElement};
     use semver::Version;
-    use vm_core::{
-        Felt, FieldElement,
-        utils::{Deserializable, Serializable},
-    };
 
     use super::FeltRepresentation;
-    use crate::{
-        AccountError,
-        account::{
-            AccountComponent, StorageValueName,
-            component::{
-                FieldIdentifier,
-                template::{
-                    AccountComponentMetadata, AccountComponentTemplate, InitStorageData,
-                    storage::StorageEntry,
-                },
-            },
-        },
-        errors::AccountComponentTemplateError,
-        testing::account_code::CODE,
+    use crate::AccountError;
+    use crate::account::component::FieldIdentifier;
+    use crate::account::component::template::storage::StorageEntry;
+    use crate::account::component::template::{
+        AccountComponentMetadata,
+        AccountComponentTemplate,
+        InitStorageData,
     };
+    use crate::account::{AccountComponent, StorageValueName};
+    use crate::errors::AccountComponentTemplateError;
+    use crate::testing::account_code::CODE;
 
     fn default_felt_array() -> [FeltRepresentation; 4] {
         [
@@ -386,7 +379,7 @@ mod tests {
             storage,
         };
 
-        let serialized = original_config.as_toml().unwrap();
+        let serialized = original_config.to_toml().unwrap();
         let deserialized = AccountComponentMetadata::from_toml(&serialized).unwrap();
         assert_eq!(deserialized, original_config);
     }
@@ -485,6 +478,8 @@ mod tests {
 
     #[test]
     pub fn fail_duplicate_key_instance() {
+        let _ = color_eyre::install();
+
         let toml_text = r#"
             name = "Test Component"
             description = "This is a test component"
@@ -507,10 +502,13 @@ mod tests {
 
         // Fail to instantiate on a duplicate key
 
-        let init_storage_data = InitStorageData::new([(
-            StorageValueName::new("map.duplicate_key").unwrap(),
-            "0x0000000000000000000000000000000000000000000000000100000000000000".to_string(),
-        )]);
+        let init_storage_data = InitStorageData::new(
+            [(
+                StorageValueName::new("map.duplicate_key").unwrap(),
+                "0x0000000000000000000000000000000000000000000000000100000000000000".to_string(),
+            )],
+            BTreeMap::new(),
+        );
         let account_component = AccountComponent::from_template(&template, &init_storage_data);
         assert_matches!(
             account_component,
@@ -520,10 +518,10 @@ mod tests {
         );
 
         // Successfully instantiate a map (keys are not duplicate)
-        let valid_init_storage_data = InitStorageData::new([(
-            StorageValueName::new("map.duplicate_key").unwrap(),
-            "0x30".to_string(),
-        )]);
+        let valid_init_storage_data = InitStorageData::new(
+            [(StorageValueName::new("map.duplicate_key").unwrap(), "0x30".to_string())],
+            BTreeMap::new(),
+        );
         AccountComponent::from_template(&template, &valid_init_storage_data).unwrap();
     }
 }

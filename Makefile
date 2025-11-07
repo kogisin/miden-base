@@ -7,7 +7,6 @@ help:
 # -- variables --------------------------------------------------------------------------------------
 
 WARNINGS=RUSTDOCFLAGS="-D warnings"
-ALL_FEATURES_BUT_ASYNC=--features concurrent,testing
 # Enable file generation in the `src` directory.
 # This is used in the build scripts of miden-lib.
 BUILD_GENERATED_FILES_IN_SRC=BUILD_GENERATED_FILES_IN_SRC=1
@@ -19,17 +18,17 @@ BACKTRACE=RUST_BACKTRACE=1
 
 .PHONY: clippy
 clippy: ## Runs Clippy with configs
-	cargo clippy --workspace --all-targets $(ALL_FEATURES_BUT_ASYNC) -- -D warnings
+	cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 
 .PHONY: clippy-no-std
 clippy-no-std: ## Runs Clippy with configs
-	cargo clippy --no-default-features --target wasm32-unknown-unknown --workspace --lib --exclude bench-prover -- -D warnings
+	cargo clippy --no-default-features --target wasm32-unknown-unknown --workspace --lib -- -D warnings
 
 
 .PHONY: fix
 fix: ## Runs Fix with configs
-	cargo fix --workspace --allow-staged --allow-dirty --all-targets $(ALL_FEATURES_BUT_ASYNC)
+	cargo fix --workspace --allow-staged --allow-dirty --all-targets --all-features
 
 
 .PHONY: format
@@ -45,24 +44,33 @@ format-check: ## Runs Format using nightly toolchain but only in check mode
 typos-check: ## Runs spellchecker
 	typos
 
+.PHONY: toml
+toml: ## Runs Format for all TOML files
+	taplo fmt
+
+.PHONY: toml-check
+toml-check: ## Runs Format for all TOML files but only in check mode
+	taplo fmt --check
+
 .PHONY: lint
-lint: ## Runs all linting tasks at once (Clippy, fixing, formatting)
+lint: ## Runs all linting tasks at once (Clippy, fixing, formatting, typos)
 	@$(BUILD_GENERATED_FILES_IN_SRC) $(MAKE) format
 	@$(BUILD_GENERATED_FILES_IN_SRC) $(MAKE) fix
 	@$(BUILD_GENERATED_FILES_IN_SRC) $(MAKE) clippy
 	@$(BUILD_GENERATED_FILES_IN_SRC) $(MAKE) clippy-no-std
 	@$(BUILD_GENERATED_FILES_IN_SRC) $(MAKE) typos-check
+	@$(BUILD_GENERATED_FILES_IN_SRC) $(MAKE) toml
 
 # --- docs ----------------------------------------------------------------------------------------
 
 .PHONY: doc
 doc: ## Generates & checks documentation
-	$(WARNINGS) cargo doc $(ALL_FEATURES_BUT_ASYNC) --keep-going --release
+	$(WARNINGS) cargo doc --all-features --keep-going --release
 
 
-.PHONY: book
-book: ## Builds the book & serves documentation site
-	mdbook serve --open docs
+.PHONY: serve-docs
+serve-docs: ## Serves the docs
+	cd docs && npm run start:dev
 
 # --- testing -------------------------------------------------------------------------------------
 
@@ -85,14 +93,14 @@ test-dev: ## Run default tests excluding slow prove tests in debug mode intended
 
 .PHONY: test-docs
 test-docs: ## Run documentation tests
-	$(WARNINGS) cargo test --doc $(ALL_FEATURES_BUT_ASYNC)
+	$(WARNINGS) cargo test --doc
 
 
 # --- checking ------------------------------------------------------------------------------------
 
 .PHONY: check
 check: ## Check all targets and features for errors without code generation
-	$(BUILD_GENERATED_FILES_IN_SRC) cargo check --all-targets $(ALL_FEATURES_BUT_ASYNC)
+	$(BUILD_GENERATED_FILES_IN_SRC) cargo check --all-targets --all-features
 
 
 .PHONY: check-no-std
@@ -108,42 +116,47 @@ build: ## By default we should build in release mode
 
 .PHONY: build-no-std
 build-no-std: ## Build without the standard library
-	$(BUILD_GENERATED_FILES_IN_SRC) cargo build --no-default-features --target wasm32-unknown-unknown --workspace --lib --exclude bench-prover
+	$(BUILD_GENERATED_FILES_IN_SRC) cargo build --no-default-features --target wasm32-unknown-unknown --workspace --lib
 
 
 .PHONY: build-no-std-testing
 build-no-std-testing: ## Build without the standard library. Includes the `testing` feature
-	$(BUILD_GENERATED_FILES_IN_SRC) cargo build --no-default-features --target wasm32-unknown-unknown --workspace --exclude miden-bench-tx --features testing --exclude bench-prover
-
-
-.PHONY: build-async
-build-async: ## Build with the `async` feature enabled (only libraries)
-	$(BUILD_GENERATED_FILES_IN_SRC) cargo build --lib --release --features async --workspace --exclude bench-prover
+	$(BUILD_GENERATED_FILES_IN_SRC) cargo build --no-default-features --target wasm32-unknown-unknown --workspace --exclude bench-transaction --features testing
 
 # --- benchmarking --------------------------------------------------------------------------------
 
 .PHONY: bench-tx
 bench-tx: ## Run transaction benchmarks
-	cargo run --bin bench-tx
+	cargo run --bin bench-transaction --features concurrent
+	cargo bench --bin bench-transaction --bench time_counting_benchmarks --features concurrent
 
-.PHONY: bench-prover
-bench-prover: ## Run prover benchmarks and consolidate results.
-	cargo bench --bin bench-prover --bench benches
-	cargo run --bin bench-prover
+.PHONY: bench-note-checker
+bench-note-checker: ## Run note checker benchmarks
+	cargo bench --bin bench-note-checker --bench benches
 
 # --- installing ----------------------------------------------------------------------------------
 
 .PHONY: check-tools
 check-tools: ## Checks if development tools are installed
 	@echo "Checking development tools..."
-	@command -v mdbook >/dev/null 2>&1 && echo "[OK] mdbook is installed" || echo "[MISSING] mdbook is not installed (run: make install-tools)"
+	@command -v npm >/dev/null 2>&1 && echo "[OK] npm is installed" || echo "[MISSING] npm is not installed (run: make install-tools)"
 	@command -v typos >/dev/null 2>&1 && echo "[OK] typos is installed" || echo "[MISSING] typos is not installed (run: make install-tools)"
-	@command -v nextest >/dev/null 2>&1 && echo "[OK] nextest is installed" || echo "[MISSING] nextest is not installed (run: make install-tools)"
+	@command -v cargo nextest >/dev/null 2>&1 && echo "[OK] cargo-nextest is installed" || echo "[MISSING] cargo-nextest is not installed (run: make install-tools)"
+	@command -v taplo >/dev/null 2>&1 && echo "[OK] taplo is installed" || echo "[MISSING] taplo is not installed (run: make install-tools)"
+	@command -v cargo-machete >/dev/null 2>&1 && echo "[OK] cargo-machete is installed" || echo "[MISSING] cargo-machete is not installed (run: make install-tools)"
 
 .PHONY: install-tools
-install-tools: ## Installs development tools required by the Makefile (mdbook, typos, nextest)
-	@echo "Installing development tools..."
-	cargo install mdbook --locked
+install-tools: ## Installs development tools required by the Makefile (mdbook, typos, nextest, taplo)
+	@echo "Installing development tools...""
+	@if ! command -v node >/dev/null 2>&1; then \
+		echo "Node.js not found. Please install Node.js from https://nodejs.org/ or using your package manager"; \
+		echo "On macOS: brew install node"; \
+		echo "On Ubuntu/Debian: sudo apt install nodejs npm"; \
+		echo "On Windows: Download from https://nodejs.org/"; \
+		exit 1; \
+	fi
 	cargo install typos-cli --locked
 	cargo install cargo-nextest --locked
+	cargo install taplo-cli --locked
+	cargo install cargo-machete --locked
 	@echo "Development tools installation complete!"

@@ -1,50 +1,36 @@
-#[cfg(feature = "async")]
-use alloc::boxed::Box;
-use alloc::{collections::BTreeSet, sync::Arc, vec::Vec};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use miden_lib::transaction::TransactionKernel;
-use miden_objects::{
-    account::delta::AccountUpdateDetails,
-    assembly::DefaultSourceManager,
-    transaction::{OutputNote, ProvenTransaction, ProvenTransactionBuilder, TransactionWitness},
+use miden_objects::account::delta::AccountUpdateDetails;
+use miden_objects::account::{AccountDelta, PartialAccount};
+use miden_objects::asset::Asset;
+use miden_objects::block::BlockNumber;
+use miden_objects::transaction::{
+    InputNote,
+    InputNotes,
+    OutputNote,
+    ProvenTransaction,
+    ProvenTransactionBuilder,
+    TransactionInputs,
+    TransactionOutputs,
 };
 pub use miden_prover::ProvingOptions;
-use miden_prover::prove;
-use vm_processor::{Digest, MemAdviceProvider};
-use winter_maybe_async::*;
+use miden_prover::{ExecutionProof, Word, prove};
 
-use super::{TransactionHost, TransactionProverError};
-use crate::host::ScriptMastForestStore;
+use super::TransactionProverError;
+use crate::host::{AccountProcedureIndexMap, ScriptMastForestStore};
+
+mod prover_host;
+pub use prover_host::TransactionProverHost;
 
 mod mast_store;
 pub use mast_store::TransactionMastStore;
-
-// TRANSACTION PROVER TRAIT
-// ================================================================================================
-
-/// The [TransactionProver] trait defines the interface that transaction witness objects use to
-/// prove transactions and generate a [ProvenTransaction].
-#[maybe_async_trait]
-pub trait TransactionProver {
-    /// Proves the provided transaction and returns a [ProvenTransaction].
-    ///
-    /// # Errors
-    /// - If the input note data in the transaction witness is corrupt.
-    /// - If the transaction program cannot be proven.
-    /// - If the transaction result is corrupt.
-    #[maybe_async]
-    fn prove(
-        &self,
-        tx_witness: TransactionWitness,
-    ) -> Result<ProvenTransaction, TransactionProverError>;
-}
 
 // LOCAL TRANSACTION PROVER
 // ------------------------------------------------------------------------------------------------
 
 /// Local Transaction prover is a stateless component which is responsible for proving transactions.
-///
-/// Local Transaction Prover implements the [TransactionProver] trait.
 pub struct LocalTransactionProver {
     mast_store: Arc<TransactionMastStore>,
     proof_options: ProvingOptions,
@@ -58,6 +44,117 @@ impl LocalTransactionProver {
             proof_options,
         }
     }
+
+    fn build_proven_transaction(
+        &self,
+        input_notes: &InputNotes<InputNote>,
+        tx_outputs: TransactionOutputs,
+        pre_fee_account_delta: AccountDelta,
+        account: PartialAccount,
+        ref_block_num: BlockNumber,
+        ref_block_commitment: Word,
+        proof: ExecutionProof,
+    ) -> Result<ProvenTransaction, TransactionProverError> {
+        // erase private note information (convert private full notes to just headers)
+        let output_notes: Vec<_> = tx_outputs.output_notes.iter().map(OutputNote::shrink).collect();
+
+        // Compute the commitment of the pre-fee delta, which goes into the proven transaction,
+        // since it is the output of the transaction and so is needed for proof verification.
+        let pre_fee_delta_commitment: Word = pre_fee_account_delta.to_commitment();
+
+        let builder = ProvenTransactionBuilder::new(
+            account.id(),
+            account.initial_commitment(),
+            tx_outputs.account.commitment(),
+            pre_fee_delta_commitment,
+            ref_block_num,
+            ref_block_commitment,
+            tx_outputs.fee,
+            tx_outputs.expiration_block_num,
+            proof,
+        )
+        .add_input_notes(input_notes)
+        .add_output_notes(output_notes);
+
+        // The full transaction delta is the pre fee delta with the fee asset removed.
+        let mut post_fee_account_delta = pre_fee_account_delta;
+        post_fee_account_delta
+            .vault_mut()
+            .remove_asset(Asset::from(tx_outputs.fee))
+            .map_err(TransactionProverError::RemoveFeeAssetFromDelta)?;
+
+        let builder = match account.has_public_state() {
+            true => {
+                let account_update_details = AccountUpdateDetails::Delta(post_fee_account_delta);
+                builder.account_update_details(account_update_details)
+            },
+            false => builder,
+        };
+
+        builder.build().map_err(TransactionProverError::ProvenTransactionBuildFailed)
+    }
+
+    pub fn prove(
+        &self,
+        tx_inputs: impl Into<TransactionInputs>,
+    ) -> Result<ProvenTransaction, TransactionProverError> {
+        let tx_inputs = tx_inputs.into();
+        let (stack_inputs, advice_inputs) = TransactionKernel::prepare_inputs(&tx_inputs)
+            .map_err(TransactionProverError::ConflictingAdviceMapEntry)?;
+
+        self.mast_store.load_account_code(tx_inputs.account().code());
+        for account_code in tx_inputs.foreign_account_code() {
+            self.mast_store.load_account_code(account_code);
+        }
+
+        let script_mast_store = ScriptMastForestStore::new(
+            tx_inputs.tx_script(),
+            tx_inputs.input_notes().iter().map(|n| n.note().script()),
+        );
+
+        let account_procedure_index_map = AccountProcedureIndexMap::new(
+            tx_inputs.foreign_account_code().iter().chain([tx_inputs.account().code()]),
+        )
+        .map_err(TransactionProverError::CreateAccountProcedureIndexMap)?;
+
+        let (partial_account, ref_block, _, input_notes, _) = tx_inputs.into_parts();
+        let mut host = TransactionProverHost::new(
+            &partial_account,
+            input_notes,
+            self.mast_store.as_ref(),
+            script_mast_store,
+            account_procedure_index_map,
+        );
+
+        let advice_inputs = advice_inputs.into_advice_inputs();
+
+        let (stack_outputs, proof) = prove(
+            &TransactionKernel::main(),
+            stack_inputs,
+            advice_inputs.clone(),
+            &mut host,
+            self.proof_options.clone(),
+        )
+        .map_err(TransactionProverError::TransactionProgramExecutionFailed)?;
+
+        // Extract transaction outputs and process transaction data.
+        // Note that the account delta does not contain the removed transaction fee, so it is the
+        // "pre-fee" delta of the transaction.
+        let (pre_fee_account_delta, input_notes, output_notes, _tx_progress) = host.into_parts();
+        let tx_outputs =
+            TransactionKernel::from_transaction_parts(&stack_outputs, &advice_inputs, output_notes)
+                .map_err(TransactionProverError::TransactionOutputConstructionFailed)?;
+
+        self.build_proven_transaction(
+            &input_notes,
+            tx_outputs,
+            pre_fee_account_delta,
+            partial_account,
+            ref_block.block_num(),
+            ref_block.commitment(),
+            proof,
+        )
+    }
 }
 
 impl Default for LocalTransactionProver {
@@ -69,102 +166,24 @@ impl Default for LocalTransactionProver {
     }
 }
 
-#[maybe_async_trait]
-impl TransactionProver for LocalTransactionProver {
-    #[maybe_async]
-    fn prove(
+#[cfg(any(feature = "testing", test))]
+impl LocalTransactionProver {
+    pub fn prove_dummy(
         &self,
-        tx_witness: TransactionWitness,
+        executed_transaction: miden_objects::transaction::ExecutedTransaction,
     ) -> Result<ProvenTransaction, TransactionProverError> {
-        let TransactionWitness { tx_inputs, tx_args, advice_witness } = tx_witness;
+        let (tx_inputs, tx_outputs, account_delta, _) = executed_transaction.into_parts();
 
-        let account = tx_inputs.account();
-        let input_notes = tx_inputs.input_notes();
-        let ref_block_num = tx_inputs.block_header().block_num();
-        let ref_block_commitment = tx_inputs.block_header().commitment();
+        let (partial_account, ref_block, _, input_notes, _) = tx_inputs.into_parts();
 
-        // execute and prove
-        let (stack_inputs, advice_inputs) =
-            TransactionKernel::prepare_inputs(&tx_inputs, &tx_args, Some(advice_witness));
-        let advice_provider = MemAdviceProvider::from(advice_inputs.into_inner());
-
-        // load the store with account/note/tx_script MASTs
-        self.mast_store.load_account_code(account.code());
-
-        let account_code_commitments: BTreeSet<Digest> = tx_args.foreign_account_code_commitments();
-
-        let script_mast_store = ScriptMastForestStore::new(
-            tx_args.tx_script(),
-            input_notes.iter().map(|n| n.note().script()),
-        );
-
-        let mut host: TransactionHost<_> = TransactionHost::new(
-            &account.into(),
-            advice_provider,
-            self.mast_store.as_ref(),
-            script_mast_store,
-            None,
-            account_code_commitments,
+        self.build_proven_transaction(
+            &input_notes,
+            tx_outputs,
+            account_delta,
+            partial_account,
+            ref_block.block_num(),
+            ref_block.commitment(),
+            ExecutionProof::new_dummy(),
         )
-        .map_err(TransactionProverError::TransactionHostCreationFailed)?;
-
-        // For the prover, we assume that the transaction witness was successfully executed and so
-        // there is no need to provide the actual source manager, as it is only used to improve
-        // error quality. So we simply pass an empty one.
-        let source_manager = Arc::new(DefaultSourceManager::default());
-        let (stack_outputs, proof) = maybe_await!(prove(
-            &TransactionKernel::main(),
-            stack_inputs,
-            &mut host,
-            self.proof_options.clone(),
-            source_manager
-        ))
-        .map_err(TransactionProverError::TransactionProgramExecutionFailed)?;
-
-        // extract transaction outputs and process transaction data
-        let (advice_provider, account_delta, output_notes, _signatures, _tx_progress) =
-            host.into_parts();
-        let (_, map, _) = advice_provider.into_parts();
-        let tx_outputs =
-            TransactionKernel::from_transaction_parts(&stack_outputs, &map.into(), output_notes)
-                .map_err(TransactionProverError::TransactionOutputConstructionFailed)?;
-
-        // erase private note information (convert private full notes to just headers)
-        let output_notes: Vec<_> = tx_outputs.output_notes.iter().map(OutputNote::shrink).collect();
-        let account_delta_commitment = account_delta.commitment();
-
-        let builder = ProvenTransactionBuilder::new(
-            account.id(),
-            account.init_commitment(),
-            tx_outputs.account.commitment(),
-            account_delta_commitment,
-            ref_block_num,
-            ref_block_commitment,
-            tx_outputs.expiration_block_num,
-            proof,
-        )
-        .add_input_notes(input_notes)
-        .add_output_notes(output_notes);
-
-        // If the account is on-chain, add the update details.
-        let builder = match account.is_onchain() {
-            true => {
-                let account_update_details = if account.is_new() {
-                    let mut account = account.clone();
-                    account
-                        .apply_delta(&account_delta)
-                        .map_err(TransactionProverError::AccountDeltaApplyFailed)?;
-
-                    AccountUpdateDetails::New(account)
-                } else {
-                    AccountUpdateDetails::Delta(account_delta)
-                };
-
-                builder.account_update_details(account_update_details)
-            },
-            false => builder,
-        };
-
-        builder.build().map_err(TransactionProverError::ProvenTransactionBuildFailed)
     }
 }
