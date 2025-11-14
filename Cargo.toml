@@ -19,7 +19,7 @@ homepage     = "https://miden.xyz"
 license      = "MIT"
 repository   = "https://github.com/0xMiden/miden-base"
 rust-version = "1.90"
-version      = "0.12.1"
+version      = "0.12.2"
 
 [profile.release]
 codegen-units = 1
@@ -52,11 +52,11 @@ miden-air             = { default-features = false, version = "0.19" }
 miden-assembly        = { default-features = false, version = "0.19" }
 miden-assembly-syntax = { default-features = false, version = "0.19" }
 miden-core            = { default-features = false, version = "0.19" }
-miden-crypto          = { default-features = false, version = "0.18" }
+miden-crypto          = { default-features = false, version = "0.18.2" }
 miden-mast-package    = { default-features = false, version = "0.19" }
 miden-processor       = { default-features = false, version = "0.19" }
 miden-prover          = { default-features = false, version = "0.19" }
-miden-stdlib          = { default-features = false, version = "0.19" }
+miden-stdlib          = { default-features = false, version = "0.19.1" }
 miden-utils-sync      = { default-features = false, version = "0.19" }
 miden-verifier        = { default-features = false, version = "0.19" }
 
